@@ -1,0 +1,1665 @@
+{
+  "name": "DEVMEET_Meeting_Processor_v3",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "devmeet-meeting-ai",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -2544,
+        352
+      ],
+      "id": "617188af-e7a0-47c1-b2d4-591192392ac8",
+      "name": "Webhook - Meeting AI Request",
+      "webhookId": "devmeet-meeting-ai-webhook-v3"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body ?? $json;\nconst headers = $json.headers ?? {};\nconst startTimestamp = Date.now();\n\n// 1. Webhook Authentication (Fail-Closed)\nconst authHeader = String(headers['x-webhook-secret'] || headers['authorization'] || '').trim();\nlet expectedSecret = '7f3c9a81d2e64b5fa8c1e7d93b6a4f20c5e8d1a7';\ntry {\n  const envSec = $env.DEVMEET_WEBHOOK_SECRET;\n  if (envSec) expectedSecret = String(envSec).trim();\n} catch (e) {}\n\nif (!expectedSecret) {\n  return [{\n    json: {\n      is_error: true,\n      http_code: 500,\n      error: {\n        code: 'SECURITY_CONFIG_ERROR',\n        message: 'DEVMEET_WEBHOOK_SECRET is not configured on server.',\n        details: null\n      }\n    }\n  }];\n}\n\nif (authHeader !== expectedSecret && authHeader !== `Bearer ${expectedSecret}`) {\n  return [{\n    json: {\n      is_error: true,\n      http_code: 401,\n      error: {\n        code: 'UNAUTHORIZED',\n        message: 'Invalid or missing webhook authentication secret.',\n        details: null\n      }\n    }\n  }];\n}\n\n// 2. Action Validation\nconst action = String(body.action || '').trim().toUpperCase();\nif (!action || (action !== 'AI_PROCESS' && action !== 'SHEETS_RETRY')) {\n  return [{\n    json: {\n      is_error: true,\n      http_code: 400,\n      error: {\n        code: 'INVALID_ACTION',\n        message: \"Action field is required and must be either 'AI_PROCESS' or 'SHEETS_RETRY'.\",\n        details: null,\n        request_id: body.request_id || null,\n        meeting_id: body.meeting_id || null\n      }\n    }\n  }];\n}\n\n// 3. Mandatory Field Validation (request_id & meeting_id)\nif (!body.request_id || typeof body.request_id !== 'string' || !body.request_id.trim()) {\n  return [{\n    json: {\n      is_error: true,\n      http_code: 400,\n      error: {\n        code: 'INVALID_REQUEST',\n        message: 'Missing required field: request_id is required.',\n        details: null,\n        meeting_id: body.meeting_id || null\n      }\n    }\n  }];\n}\n\nif (!body.meeting_id || typeof body.meeting_id !== 'string' || !body.meeting_id.trim()) {\n  return [{\n    json: {\n      is_error: true,\n      http_code: 400,\n      error: {\n        code: 'INVALID_REQUEST',\n        message: 'Missing required field: meeting_id is required.',\n        details: null,\n        request_id: String(body.request_id)\n      }\n    }\n  }];\n}\n\n// 4. Task Validation\nconst allowedTasks = ['summary', 'key_points', 'decisions', 'action_items', 'follow_up_email'];\nconst rawTasks = Array.isArray(body.tasks) ? body.tasks : (typeof body.tasks === 'string' ? [body.tasks] : []);\nconst tasks = rawTasks.map(t => String(t).toLowerCase().trim()).filter(Boolean);\n\nif (tasks.length === 0) {\n  return [{\n    json: {\n      is_error: true,\n      http_code: 400,\n      error: {\n        code: 'INVALID_REQUEST',\n        message: 'Missing or invalid required field: tasks must be a non-empty array.',\n        details: null,\n        request_id: String(body.request_id),\n        meeting_id: String(body.meeting_id)\n      }\n    }\n  }];\n}\n\nfor (const t of tasks) {\n  if (!allowedTasks.includes(t)) {\n    return [{\n      json: {\n        is_error: true,\n        http_code: 400,\n        error: {\n          code: 'INVALID_REQUEST',\n          message: `Invalid task '${t}'. Allowed tasks: ${allowedTasks.join(', ')}.`,\n          details: null,\n          request_id: String(body.request_id),\n          meeting_id: String(body.meeting_id)\n        }\n      }\n    }];\n  }\n}\n\n// 5. Action-Specific Validation\nif (action === 'AI_PROCESS') {\n  const transcriptPromptText = body.transcript_prompt_text;\n  if (!transcriptPromptText || typeof transcriptPromptText !== 'string' || !transcriptPromptText.trim()) {\n    return [{\n      json: {\n        is_error: true,\n        http_code: 400,\n        error: {\n          code: 'INVALID_REQUEST',\n          message: 'transcript_prompt_text is required and cannot be empty for AI_PROCESS.',\n          details: null,\n          request_id: String(body.request_id),\n          meeting_id: String(body.meeting_id)\n        }\n      }\n    }];\n  }\n\n  const MAX_TRANSCRIPT_CHARS = 120000;\n  if (transcriptPromptText.length > MAX_TRANSCRIPT_CHARS) {\n    return [{\n      json: {\n        is_error: true,\n        http_code: 422,\n        error: {\n          code: 'INPUT_TOO_LARGE',\n          message: `Transcript exceeds maximum allowed size (${transcriptPromptText.length}/${MAX_TRANSCRIPT_CHARS} chars).`,\n          details: null,\n          request_id: String(body.request_id),\n          meeting_id: String(body.meeting_id)\n        }\n      }\n    }];\n  }\n\n  // Strict Google Gemini Provider Enforcement\n  if (body.ai_provider !== undefined && body.ai_provider !== null) {\n    const rawProvider = String(body.ai_provider).toLowerCase().trim();\n    if (rawProvider !== 'google' && rawProvider !== 'gemini') {\n      return [{\n        json: {\n          is_error: true,\n          http_code: 400,\n          error: {\n            code: 'INVALID_REQUEST',\n            message: `Unsupported ai_provider '${rawProvider}'. Only 'google' / 'gemini' is supported.`,\n            details: null,\n            request_id: String(body.request_id),\n            meeting_id: String(body.meeting_id)\n          }\n        }\n      }];\n    }\n  }\n\n  const meetingTitle = body.meeting_title || 'Untitled Meeting';\n  const meetingDate = body.meeting_date || new Date().toISOString().split('T')[0];\n  const participants = Array.isArray(body.participants) ? body.participants : [];\n  const selectedSource = body.selected_source || 'official';\n\n  return [{\n    json: {\n      is_error: false,\n      action: 'AI_PROCESS',\n      request_id: String(body.request_id).trim(),\n      meeting_id: String(body.meeting_id).trim(),\n      meeting_title: String(meetingTitle).trim(),\n      meeting_date: String(meetingDate).trim(),\n      participants: participants.map(p => typeof p === 'string' ? { name: p } : { id: p.id || null, name: p.name || p.displayName || 'Unknown', email: p.email || null }),\n      tasks: tasks,\n      ai_provider: 'google',\n      selected_source: selectedSource,\n      force_reprocess: Boolean(body.force_reprocess ?? false),\n      transcript_prompt_text: transcriptPromptText.trim(),\n      start_timestamp: startTimestamp\n    }\n  }];\n}\n\nif (action === 'SHEETS_RETRY') {\n  const cachedAiResult = body.cached_ai_result;\n  if (!cachedAiResult || typeof cachedAiResult !== 'object') {\n    return [{\n      json: {\n        is_error: true,\n        http_code: 400,\n        error: {\n          code: 'CACHED_AI_RESULT_REQUIRED',\n          message: 'cached_ai_result is required and must be an object for SHEETS_RETRY.',\n          details: null,\n          request_id: String(body.request_id),\n          meeting_id: String(body.meeting_id)\n        }\n      }\n    }];\n  }\n\n  if (!cachedAiResult.summary || typeof cachedAiResult.summary !== 'string') {\n    return [{\n      json: {\n        is_error: true,\n        http_code: 400,\n        error: {\n          code: 'INVALID_CACHED_AI_RESULT',\n          message: 'cached_ai_result missing valid summary field.',\n          details: null,\n          request_id: String(body.request_id),\n          meeting_id: String(body.meeting_id)\n        }\n      }\n    }];\n  }\n\n  const meetingTitle = body.meeting_title || 'Untitled Meeting';\n  const meetingDate = body.meeting_date || new Date().toISOString().split('T')[0];\n\n  return [{\n    json: {\n      is_error: false,\n      action: 'SHEETS_RETRY',\n      request_id: String(body.request_id).trim(),\n      meeting_id: String(body.meeting_id).trim(),\n      meeting_title: String(meetingTitle).trim(),\n      meeting_date: String(meetingDate).trim(),\n      tasks: tasks,\n      cached_ai_result: cachedAiResult,\n      start_timestamp: startTimestamp\n    }\n  }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2320,
+        352
+      ],
+      "id": "b1f81ac1-f104-4dd9-8dc1-858f42ba129f",
+      "name": "Authenticate & Validate Input"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000001",
+              "leftValue": "={{ $json.is_error }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2144,
+        352
+      ],
+      "id": "3ded7bda-a309-4bf3-b54b-1e8e52f25297",
+      "name": "Check Request Valid"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\n  \"status\": \"error\",\n  \"error\": $json.error\n} }}",
+        "options": {
+          "responseCode": "={{ $json.http_code || 400 }}"
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        -1840,
+        176
+      ],
+      "id": "4e5870ba-fcc3-4ab4-87e6-2ee431903d64",
+      "name": "Respond - Validation/Auth Error"
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n  \"summary\": \"Tóm tắt nội dung cuộc họp bằng tiếng Việt...\",\n  \"key_points\": [\n    \"Điểm kỹ thuật quan trọng 1 (Tiếng Việt)\",\n    \"Điểm kỹ thuật quan trọng 2 (Tiếng Việt)\"\n  ],\n  \"decisions\": [\n    {\n      \"decision\": \"Quyết định kỹ thuật đã thống nhất (Tiếng Việt)\",\n      \"context\": \"Bối cảnh quyết định (Tiếng Việt)\",\n      \"evidence_timestamp\": \"09:15:10\"\n    }\n  ],\n  \"action_items\": [\n    {\n      \"task\": \"Nhiệm vụ cụ thể cần thực hiện (Tiếng Việt)\",\n      \"assignee\": \"Nguyen Van A\",\n      \"deadline\": \"2026-08-22\",\n      \"status\": \"TODO\",\n      \"evidence_timestamp\": \"09:20:05\"\n    }\n  ],\n  \"follow_up_email\": {\n    \"subject\": \"[DevMeet AI] Tóm tắt cuộc họp & Kế hoạch hành động\",\n    \"body\": \"Chào mọi người,\\n\\nDưới đây là tóm tắt nội dung và các việc cần làm sau cuộc họp...\"\n  }\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -1696,
+        688
+      ],
+      "id": "c83c0704-611b-4ad7-91b1-d1812ec87f24",
+      "name": "Structured Output Parser"
+    },
+    {
+      "parameters": {
+        "jsCode": "const inputData = $('Authenticate & Validate Input').item.json;\nconst rawOutput = $json.output ?? $json.response?.output ?? $json.result ?? $json;\n\nfunction validateAiResponse(raw) {\n  if (!raw) return { valid: false, error: 'Empty output from AI model.' };\n\n  let parsed = raw;\n  if (typeof raw === 'string') {\n    try {\n      parsed = JSON.parse(raw);\n    } catch (e) {\n      return { valid: false, error: `Invalid JSON format: ${e.message}` };\n    }\n  }\n\n  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {\n    return { valid: false, error: 'AI output root must be a JSON object.' };\n  }\n\n  if (!parsed.summary || typeof parsed.summary !== 'string' || !parsed.summary.trim()) {\n    return { valid: false, error: 'Missing or empty required field: summary.' };\n  }\n\n  if (!Array.isArray(parsed.key_points)) {\n    return { valid: false, error: 'Field key_points must be an array of strings.' };\n  }\n  for (let i = 0; i < parsed.key_points.length; i++) {\n    const kp = parsed.key_points[i];\n    if (typeof kp !== 'string' || !kp.trim()) {\n      return { valid: false, error: `key_points element at index ${i} must be a non-empty string.` };\n    }\n  }\n\n  if (!Array.isArray(parsed.decisions)) {\n    return { valid: false, error: 'Field decisions must be an array.' };\n  }\n  for (let i = 0; i < parsed.decisions.length; i++) {\n    const d = parsed.decisions[i];\n    if (!d || typeof d !== 'object' || Array.isArray(d)) {\n      return { valid: false, error: `decisions element at index ${i} must be an object.` };\n    }\n    if (!d.decision || typeof d.decision !== 'string' || !d.decision.trim()) {\n      return { valid: false, error: `Decision at index ${i} missing required non-empty string 'decision'.` };\n    }\n    if (d.context === undefined || d.context === null || typeof d.context !== 'string') {\n      return { valid: false, error: `Decision at index ${i} missing required string 'context'.` };\n    }\n    if (!d.evidence_timestamp || typeof d.evidence_timestamp !== 'string' || !d.evidence_timestamp.trim()) {\n      return { valid: false, error: `Decision at index ${i} missing required non-empty string 'evidence_timestamp'.` };\n    }\n  }\n\n  const ALLOWED_STATUSES = ['TODO'];\n  if (!Array.isArray(parsed.action_items)) {\n    return { valid: false, error: 'Field action_items must be an array.' };\n  }\n  for (let i = 0; i < parsed.action_items.length; i++) {\n    const a = parsed.action_items[i];\n    if (!a || typeof a !== 'object' || Array.isArray(a)) {\n      return { valid: false, error: `action_items element at index ${i} must be an object.` };\n    }\n    if (!a.task || typeof a.task !== 'string' || !a.task.trim()) {\n      return { valid: false, error: `Action item at index ${i} missing required non-empty string 'task'.` };\n    }\n    if (a.status === undefined || a.status === null || typeof a.status !== 'string' || !ALLOWED_STATUSES.includes(a.status)) {\n      return { valid: false, error: `Action item at index ${i} has invalid status '${a ? a.status : null}'. Allowed status enum: ${ALLOWED_STATUSES.join(', ')}.` };\n    }\n    if (!a.evidence_timestamp || typeof a.evidence_timestamp !== 'string' || !a.evidence_timestamp.trim()) {\n      return { valid: false, error: `Action item at index ${i} missing required non-empty string 'evidence_timestamp'.` };\n    }\n  }\n\n  const email = parsed.follow_up_email;\n  if (!email || typeof email !== 'object' || Array.isArray(email)) {\n    return { valid: false, error: 'Field follow_up_email must be an object.' };\n  }\n  if (!email.subject || typeof email.subject !== 'string' || !email.subject.trim()) {\n    return { valid: false, error: 'follow_up_email.subject must be a non-empty string.' };\n  }\n  if (!email.body || typeof email.body !== 'string' || !email.body.trim()) {\n    return { valid: false, error: 'follow_up_email.body must be a non-empty string.' };\n  }\n\n  return { valid: true, data: parsed };\n}\n\nconst valResult = validateAiResponse(rawOutput);\n\nif (!valResult.valid || $json.error) {\n  return [{\n    json: {\n      is_error: true,\n      retry_needed: true,\n      validation_error_message: valResult.error || String($json.error?.message || $json.error),\n      request_id: inputData.request_id,\n      meeting_id: inputData.meeting_id,\n      meeting_title: inputData.meeting_title,\n      meeting_date: inputData.meeting_date,\n      tasks: inputData.tasks,\n      participants: inputData.participants,\n      transcript_prompt_text: inputData.transcript_prompt_text,\n      start_timestamp: inputData.start_timestamp\n    }\n  }];\n}\n\nconst aiOutput = valResult.data;\n\nconst meetingRow = {\n  meeting_id: inputData.meeting_id,\n  date: inputData.meeting_date,\n  title: inputData.meeting_title,\n  summary: aiOutput.summary.trim(),\n  created_at: new Date().toISOString(),\n  idempotency_key: `meeting:${inputData.meeting_id}:request:${inputData.request_id}:meeting`\n};\n\nconst decisionRows = aiOutput.decisions.map((d, idx) => ({\n  meeting_id: inputData.meeting_id,\n  decision: String(d.decision).trim(),\n  context: String(d.context || '').trim(),\n  evidence_timestamp: String(d.evidence_timestamp).trim(),\n  idempotency_key: `meeting:${inputData.meeting_id}:request:${inputData.request_id}:decision:${idx}`\n}));\n\nconst actionItemRows = aiOutput.action_items.map((a, idx) => ({\n  meeting_id: inputData.meeting_id,\n  task: String(a.task).trim(),\n  assignee: a.assignee ? String(a.assignee).trim() : 'Unassigned',\n  deadline: a.deadline ? String(a.deadline).trim() : 'None',\n  status: 'TODO',\n  evidence_timestamp: String(a.evidence_timestamp).trim(),\n  idempotency_key: `meeting:${inputData.meeting_id}:request:${inputData.request_id}:action:${idx}`\n}));\n\nconst emailRow = {\n  meeting_id: inputData.meeting_id,\n  subject: String(aiOutput.follow_up_email.subject).trim(),\n  body: String(aiOutput.follow_up_email.body).trim(),\n  idempotency_key: `meeting:${inputData.meeting_id}:request:${inputData.request_id}:email`\n};\n\nreturn [{\n  json: {\n    is_error: false,\n    retry_needed: false,\n    action: 'AI_PROCESS',\n    request_id: inputData.request_id,\n    meeting_id: inputData.meeting_id,\n    meeting_title: inputData.meeting_title,\n    meeting_date: inputData.meeting_date,\n    start_timestamp: inputData.start_timestamp,\n    ai_output: {\n      summary: aiOutput.summary.trim(),\n      key_points: aiOutput.key_points.map(s => s.trim()),\n      decisions: decisionRows.map(d => ({ decision: d.decision, context: d.context, evidence_timestamp: d.evidence_timestamp })),\n      action_items: actionItemRows.map(a => ({ task: a.task, assignee: a.assignee === 'Unassigned' ? null : a.assignee, deadline: a.deadline === 'None' ? null : a.deadline, status: 'TODO', evidence_timestamp: a.evidence_timestamp })),\n      follow_up_email: { subject: emailRow.subject, body: emailRow.body }\n    },\n    sheets_payload: {\n      meeting_row: meetingRow,\n      decision_rows: decisionRows,\n      action_item_rows: actionItemRows,\n      email_row: emailRow\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1488,
+        384
+      ],
+      "id": "e22a975a-5dac-43f2-9f77-80adf477ab94",
+      "name": "Validate Structured Output & Business Rules"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000002",
+              "leftValue": "={{ $json.is_error }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1280,
+        448
+      ],
+      "id": "04fbcbb8-d1a6-4223-9d87-f47da59e30a5",
+      "name": "Check AI Output Valid #1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prevData = $('Check AI Output Valid #1').item.json;\nconst rawOutput = $json.output ?? $json.response?.output ?? $json.result ?? $json;\n\nfunction validateAiResponse(raw) {\n  if (!raw) return { valid: false, error: 'Empty output from AI retry.' };\n\n  let parsed = raw;\n  if (typeof raw === 'string') {\n    try {\n      parsed = JSON.parse(raw);\n    } catch (e) {\n      return { valid: false, error: `Invalid JSON format in retry: ${e.message}` };\n    }\n  }\n\n  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {\n    return { valid: false, error: 'AI retry output must be a JSON object.' };\n  }\n\n  if (!parsed.summary || typeof parsed.summary !== 'string' || !parsed.summary.trim()) {\n    return { valid: false, error: 'Missing or empty required field: summary.' };\n  }\n\n  if (!Array.isArray(parsed.key_points)) {\n    return { valid: false, error: 'Field key_points must be an array of strings.' };\n  }\n  for (let i = 0; i < parsed.key_points.length; i++) {\n    const kp = parsed.key_points[i];\n    if (typeof kp !== 'string' || !kp.trim()) {\n      return { valid: false, error: `key_points element at index ${i} must be a non-empty string.` };\n    }\n  }\n\n  if (!Array.isArray(parsed.decisions)) {\n    return { valid: false, error: 'Field decisions must be an array.' };\n  }\n  for (let i = 0; i < parsed.decisions.length; i++) {\n    const d = parsed.decisions[i];\n    if (!d || typeof d !== 'object' || Array.isArray(d)) {\n      return { valid: false, error: `decisions element at index ${i} must be an object.` };\n    }\n    if (!d.decision || typeof d.decision !== 'string' || !d.decision.trim()) {\n      return { valid: false, error: `Decision at index ${i} missing required non-empty string 'decision'.` };\n    }\n    if (d.context === undefined || d.context === null || typeof d.context !== 'string') {\n      return { valid: false, error: `Decision at index ${i} missing required string 'context'.` };\n    }\n    if (!d.evidence_timestamp || typeof d.evidence_timestamp !== 'string' || !d.evidence_timestamp.trim()) {\n      return { valid: false, error: `Decision at index ${i} missing required non-empty string 'evidence_timestamp'.` };\n    }\n  }\n\n  const ALLOWED_STATUSES = ['TODO'];\n  if (!Array.isArray(parsed.action_items)) {\n    return { valid: false, error: 'Field action_items must be an array.' };\n  }\n  for (let i = 0; i < parsed.action_items.length; i++) {\n    const a = parsed.action_items[i];\n    if (!a || typeof a !== 'object' || Array.isArray(a)) {\n      return { valid: false, error: `action_items element at index ${i} must be an object.` };\n    }\n    if (!a.task || typeof a.task !== 'string' || !a.task.trim()) {\n      return { valid: false, error: `Action item at index ${i} missing required non-empty string 'task'.` };\n    }\n    if (a.status === undefined || a.status === null || typeof a.status !== 'string' || !ALLOWED_STATUSES.includes(a.status)) {\n      return { valid: false, error: `Action item at index ${i} has invalid status '${a ? a.status : null}'. Allowed status enum: ${ALLOWED_STATUSES.join(', ')}.` };\n    }\n    if (!a.evidence_timestamp || typeof a.evidence_timestamp !== 'string' || !a.evidence_timestamp.trim()) {\n      return { valid: false, error: `Action item at index ${i} missing required non-empty string 'evidence_timestamp'.` };\n    }\n  }\n\n  const email = parsed.follow_up_email;\n  if (!email || typeof email !== 'object' || Array.isArray(email)) {\n    return { valid: false, error: 'Field follow_up_email must be an object.' };\n  }\n  if (!email.subject || typeof email.subject !== 'string' || !email.subject.trim()) {\n    return { valid: false, error: 'follow_up_email.subject must be a non-empty string.' };\n  }\n  if (!email.body || typeof email.body !== 'string' || !email.body.trim()) {\n    return { valid: false, error: 'follow_up_email.body must be a non-empty string.' };\n  }\n\n  return { valid: true, data: parsed };\n}\n\nconst valResult = validateAiResponse(rawOutput);\n\nif (!valResult.valid || $json.error) {\n  return [{\n    json: {\n      is_error: true,\n      http_code: 502,\n      error: {\n        code: 'AI_OUTPUT_INVALID',\n        message: 'AI Model failed schema validation even after 1 retry.',\n        details: valResult.error || String($json.error?.message || $json.error),\n        request_id: prevData.request_id,\n        meeting_id: prevData.meeting_id\n      }\n    }\n  }];\n}\n\nconst aiOutput = valResult.data;\n\nconst meetingRow = {\n  meeting_id: prevData.meeting_id,\n  date: prevData.meeting_date,\n  title: prevData.meeting_title,\n  summary: aiOutput.summary.trim(),\n  created_at: new Date().toISOString(),\n  idempotency_key: `meeting:${prevData.meeting_id}:request:${prevData.request_id}:meeting`\n};\n\nconst decisionRows = aiOutput.decisions.map((d, idx) => ({\n  meeting_id: prevData.meeting_id,\n  decision: String(d.decision).trim(),\n  context: String(d.context || '').trim(),\n  evidence_timestamp: String(d.evidence_timestamp).trim(),\n  idempotency_key: `meeting:${prevData.meeting_id}:request:${prevData.request_id}:decision:${idx}`\n}));\n\nconst actionItemRows = aiOutput.action_items.map((a, idx) => ({\n  meeting_id: prevData.meeting_id,\n  task: String(a.task).trim(),\n  assignee: a.assignee ? String(a.assignee).trim() : 'Unassigned',\n  deadline: a.deadline ? String(a.deadline).trim() : 'None',\n  status: 'TODO',\n  evidence_timestamp: String(a.evidence_timestamp).trim(),\n  idempotency_key: `meeting:${prevData.meeting_id}:request:${prevData.request_id}:action:${idx}`\n}));\n\nconst emailRow = {\n  meeting_id: prevData.meeting_id,\n  subject: String(aiOutput.follow_up_email.subject).trim(),\n  body: String(aiOutput.follow_up_email.body).trim(),\n  idempotency_key: `meeting:${prevData.meeting_id}:request:${prevData.request_id}:email`\n};\n\nreturn [{\n  json: {\n    is_error: false,\n    action: 'AI_PROCESS',\n    request_id: prevData.request_id,\n    meeting_id: prevData.meeting_id,\n    meeting_title: prevData.meeting_title,\n    meeting_date: prevData.meeting_date,\n    start_timestamp: prevData.start_timestamp,\n    ai_output: {\n      summary: aiOutput.summary.trim(),\n      key_points: aiOutput.key_points.map(s => s.trim()),\n      decisions: decisionRows.map(d => ({ decision: d.decision, context: d.context, evidence_timestamp: d.evidence_timestamp })),\n      action_items: actionItemRows.map(a => ({ task: a.task, assignee: a.assignee === 'Unassigned' ? null : a.assignee, deadline: a.deadline === 'None' ? null : a.deadline, status: 'TODO', evidence_timestamp: a.evidence_timestamp })),\n      follow_up_email: { subject: emailRow.subject, body: emailRow.body }\n    },\n    sheets_payload: {\n      meeting_row: meetingRow,\n      decision_rows: decisionRows,\n      action_item_rows: actionItemRows,\n      email_row: emailRow\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -800,
+        272
+      ],
+      "id": "451ac55e-4124-412d-b4e1-a62f6ce99552",
+      "name": "Validate AI Retry Output"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000005",
+              "leftValue": "={{ $json.is_error }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -560,
+        272
+      ],
+      "id": "3c9510fd-e18d-4bb8-9b4c-2805c464d377",
+      "name": "Check AI Retry Valid"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\n  \"status\": \"error\",\n  \"error\": $json.error\n} }}",
+        "options": {
+          "responseCode": "={{ $json.http_code || 502 }}"
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        -320,
+        144
+      ],
+      "id": "fecc414c-b1b2-453e-ae4b-92c0a4198c18",
+      "name": "Respond - AI Processing Error"
+    },
+    {
+      "parameters": {
+        "jsCode": "function getSourceData() {\n  try {\n    const cachedNode = $('Extract & Format Cached AI Result');\n    if (cachedNode && cachedNode.item && cachedNode.item.json && !cachedNode.item.json.is_error) {\n      return cachedNode.item.json;\n    }\n  } catch (e) {}\n  try {\n    const chk1 = $('Check AI Output Valid #1');\n    if (chk1 && chk1.item && chk1.item.json && chk1.item.json.is_error) {\n      return $('Validate AI Retry Output').item.json;\n    }\n    return $('Validate Structured Output & Business Rules').item.json;\n  } catch (e) {}\n  return $json;\n}\n\nconst sourceData = getSourceData();\nlet spreadsheetId = '1M650KwhZoTSiesYkecuoTFF0aYc9OvUHRb2M8FPXvOA';\ntry {\n  const envId = $env.DEVMEET_SPREADSHEET_ID;\n  if (envId) spreadsheetId = String(envId).trim();\n} catch (e) {}\n\nif (!spreadsheetId || !spreadsheetId.trim()) {\n  return [{\n    json: {\n      _skip: true,\n      _sheet_config_error: true,\n      _sheet_error: true,\n      _retry_needed: false,\n      _error_message: 'DEVMEET_SPREADSHEET_ID environment variable is missing or empty. Configuration error.'\n    }\n  }];\n}\n\nconst row = sourceData.sheets_payload ? sourceData.sheets_payload.meeting_row : {};\nconst meetingId = sourceData.meeting_id || sourceData.meeting_context?.meeting_id || '';\nconst requestId = sourceData.request_id || '';\nconst idempotencyKey = `meeting:${meetingId}:request:${requestId}:meeting`;\n\nreturn [{\n  json: {\n    ...row,\n    idempotency_key: idempotencyKey,\n    _idempotency_key: idempotencyKey,\n    _attempt: 1,\n    _max_attempts: 4,\n    _sheet_name: 'Meetings',\n    _skip: false,\n    _sheet_error: false\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1040,
+        544
+      ],
+      "id": "4dc2adf5-446c-4ff2-92de-227f60c7cb39",
+      "name": "Prepare Meeting Log Row"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.DEVMEET_SPREADSHEET_ID }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Meetings",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1M650KwhZoTSiesYkecuoTFF0aYc9OvUHRb2M8FPXvOA/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "meeting_id",
+              "displayName": "meeting_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "date",
+              "displayName": "date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -816,
+        544
+      ],
+      "id": "65d5f4d9-5f9b-4c5d-b048-8f594b51a4d9",
+      "name": "1. Sheets - Append Meeting",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "RAybACKg561af6JA",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function getSourceData() {\n  try {\n    const cachedNode = $('Extract & Format Cached AI Result');\n    if (cachedNode && cachedNode.item && cachedNode.item.json && !cachedNode.item.json.is_error) {\n      return cachedNode.item.json;\n    }\n  } catch (e) {}\n  try {\n    const chk1 = $('Check AI Output Valid #1');\n    if (chk1 && chk1.item && chk1.item.json && chk1.item.json.is_error) {\n      return $('Validate AI Retry Output').item.json;\n    }\n    return $('Validate Structured Output & Business Rules').item.json;\n  } catch (e) {}\n  return $json;\n}\n\nconst sourceData = getSourceData();\nconst meetingRow = sourceData.sheets_payload ? sourceData.sheets_payload.meeting_row : {};\nconst currentItem = $json;\nconst hasError = Boolean(currentItem.error || currentItem._sheet_error);\nconst attempt = currentItem._attempt || 1;\nconst idempotencyKey = currentItem._idempotency_key || `meeting:${sourceData.meeting_id}:request:${sourceData.request_id}:meeting`;\n\nif (hasError && attempt < 4) {\n  const backoffSeconds = attempt === 1 ? 5 : (attempt === 2 ? 15 : 30);\n  return [{\n    json: {\n      ...meetingRow,\n      idempotency_key: idempotencyKey,\n      _idempotency_key: idempotencyKey,\n      _attempt: attempt + 1,\n      _max_attempts: 4,\n      _sheet_name: 'Meetings',\n      _wait_seconds: backoffSeconds,\n      _retry_needed: true,\n      _sheet_error: true\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    _sheet_name: 'Meetings',\n    _retry_needed: false,\n    _sheet_error: hasError,\n    _error_message: hasError ? String(currentItem.error?.message || currentItem._error_message || 'Meeting append failed after retries') : null\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -608,
+        544
+      ],
+      "id": "7d236c02-979c-489a-a351-1804613fcd35",
+      "name": "Check Meeting Append Result"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000006",
+              "leftValue": "={{ $json._retry_needed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -384,
+        544
+      ],
+      "id": "89168aaa-d33a-44f2-bca1-25aacbef4a98",
+      "name": "Is Meeting Retry Needed?"
+    },
+    {
+      "parameters": {
+        "amount": "={{ $json._wait_seconds }}"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -608,
+        736
+      ],
+      "id": "0896da86-27d8-4a27-81a6-6ade8cb99584",
+      "name": "Wait Meeting Retry",
+      "webhookId": "af5c1362-1a63-4030-91a5-e928e091cab4"
+    },
+    {
+      "parameters": {
+        "jsCode": "function getSourceData() {\n  try {\n    const cachedNode = $('Extract & Format Cached AI Result');\n    if (cachedNode && cachedNode.item && cachedNode.item.json && !cachedNode.item.json.is_error) {\n      return cachedNode.item.json;\n    }\n  } catch (e) {}\n  try {\n    const chk1 = $('Check AI Output Valid #1');\n    if (chk1 && chk1.item && chk1.item.json && chk1.item.json.is_error) {\n      return $('Validate AI Retry Output').item.json;\n    }\n    return $('Validate Structured Output & Business Rules').item.json;\n  } catch (e) {}\n  return $json;\n}\n\nconst sourceData = getSourceData();\nlet spreadsheetId = '1M650KwhZoTSiesYkecuoTFF0aYc9OvUHRb2M8FPXvOA';\ntry {\n  const envId = $env.DEVMEET_SPREADSHEET_ID;\n  if (envId) spreadsheetId = String(envId).trim();\n} catch (e) {}\n\nif (!spreadsheetId || !spreadsheetId.trim()) {\n  return [{\n    json: {\n      _skip: true,\n      _sheet_config_error: true,\n      _sheet_error: true,\n      _retry_needed: false,\n      _error_message: 'DEVMEET_SPREADSHEET_ID environment variable is missing or empty. Configuration error.'\n    }\n  }];\n}\n\nconst decisionRows = (sourceData.sheets_payload && sourceData.sheets_payload.decision_rows) || [];\nif (decisionRows.length === 0) {\n  return [{ json: { _skip: true, _sheet_error: false } }];\n}\n\nconst meetingId = sourceData.meeting_id || sourceData.meeting_context?.meeting_id || '';\nconst requestId = sourceData.request_id || '';\n\nreturn decisionRows.map((row, idx) => ({\n  json: {\n    ...row,\n    idempotency_key: `meeting:${meetingId}:request:${requestId}:decision:${idx}`,\n    _idempotency_key: `meeting:${meetingId}:request:${requestId}:decision:${idx}`,\n    _attempt: 1,\n    _max_attempts: 4,\n    _sheet_name: 'Decisions',\n    _skip: false\n  }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -160,
+        560
+      ],
+      "id": "21b402da-2dab-4a6e-8ce9-0fcc51fdaea4",
+      "name": "Prepare Decision Rows"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000003",
+              "leftValue": "={{ $json._skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        64,
+        544
+      ],
+      "id": "a2bb4e9a-dec8-4b00-862c-8e67face582f",
+      "name": "Has Decisions?"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.DEVMEET_SPREADSHEET_ID }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 671878598,
+          "mode": "list",
+          "cachedResultName": "Decisions",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1M650KwhZoTSiesYkecuoTFF0aYc9OvUHRb2M8FPXvOA/edit#gid=671878598"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "meeting_id",
+              "displayName": "meeting_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decision",
+              "displayName": "decision",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "context",
+              "displayName": "context",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "evidence_timestamp",
+              "displayName": "evidence_timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        288,
+        448
+      ],
+      "id": "1fdfb382-91e5-4525-aec5-e3b3a0028d46",
+      "name": "2. Sheets - Append Decisions (Multiple Rows)",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "RAybACKg561af6JA",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function getSourceData() {\n  try {\n    const cachedNode = $('Extract & Format Cached AI Result');\n    if (cachedNode && cachedNode.item && cachedNode.item.json && !cachedNode.item.json.is_error) {\n      return cachedNode.item.json;\n    }\n  } catch (e) {}\n  try {\n    const chk1 = $('Check AI Output Valid #1');\n    if (chk1 && chk1.item && chk1.item.json && chk1.item.json.is_error) {\n      return $('Validate AI Retry Output').item.json;\n    }\n    return $('Validate Structured Output & Business Rules').item.json;\n  } catch (e) {}\n  return $json;\n}\n\nconst sourceData = getSourceData();\nconst decisionRows = (sourceData.sheets_payload && sourceData.sheets_payload.decision_rows) || [];\nconst items = $input.all();\nconst hasError = items.some(item => Boolean(item.json.error || item.json._sheet_error));\nconst attempt = items[0]?.json?._attempt || 1;\n\nif (hasError && attempt < 4) {\n  const backoffSeconds = attempt === 1 ? 5 : (attempt === 2 ? 15 : 30);\n  return decisionRows.map((row, idx) => ({\n    json: {\n      ...row,\n      idempotency_key: `meeting:${sourceData.meeting_id}:request:${sourceData.request_id}:decision:${idx}`,\n      _idempotency_key: `meeting:${sourceData.meeting_id}:request:${sourceData.request_id}:decision:${idx}`,\n      _attempt: attempt + 1,\n      _max_attempts: 4,\n      _sheet_name: 'Decisions',\n      _wait_seconds: backoffSeconds,\n      _retry_needed: true,\n      _sheet_error: true\n    }\n  }));\n}\n\nreturn [{\n  json: {\n    _sheet_name: 'Decisions',\n    _retry_needed: false,\n    _sheet_error: hasError,\n    _error_message: hasError ? 'Failed to append Decisions sheet after retries.' : null\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        512,
+        448
+      ],
+      "id": "87d0d2fd-90f7-43e7-8a66-8f9bb8d94be0",
+      "name": "Check Decision Append Result"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000007",
+              "leftValue": "={{ $json._retry_needed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        448
+      ],
+      "id": "8c5a6b50-8101-4a85-b018-ab5133f8d5db",
+      "name": "Is Decision Retry Needed?"
+    },
+    {
+      "parameters": {
+        "amount": "={{ $json._wait_seconds }}"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        512,
+        624
+      ],
+      "id": "b5a38002-929e-4c45-8994-4a87bad248f1",
+      "name": "Wait Decision Retry",
+      "webhookId": "9ed5340b-47d3-4c62-a588-4284bac89d18"
+    },
+    {
+      "parameters": {
+        "jsCode": "function getSourceData() {\n  try {\n    const cachedNode = $('Extract & Format Cached AI Result');\n    if (cachedNode && cachedNode.item && cachedNode.item.json && !cachedNode.item.json.is_error) {\n      return cachedNode.item.json;\n    }\n  } catch (e) {}\n  try {\n    const chk1 = $('Check AI Output Valid #1');\n    if (chk1 && chk1.item && chk1.item.json && chk1.item.json.is_error) {\n      return $('Validate AI Retry Output').item.json;\n    }\n    return $('Validate Structured Output & Business Rules').item.json;\n  } catch (e) {}\n  return $json;\n}\n\nconst sourceData = getSourceData();\nlet spreadsheetId = '1M650KwhZoTSiesYkecuoTFF0aYc9OvUHRb2M8FPXvOA';\ntry {\n  const envId = $env.DEVMEET_SPREADSHEET_ID;\n  if (envId) spreadsheetId = String(envId).trim();\n} catch (e) {}\n\nif (!spreadsheetId || !spreadsheetId.trim()) {\n  return [{\n    json: {\n      _skip: true,\n      _sheet_config_error: true,\n      _sheet_error: true,\n      _retry_needed: false,\n      _error_message: 'DEVMEET_SPREADSHEET_ID environment variable is missing or empty. Configuration error.'\n    }\n  }];\n}\n\nconst actionItemRows = (sourceData.sheets_payload && sourceData.sheets_payload.action_item_rows) || [];\nif (actionItemRows.length === 0) {\n  return [{ json: { _skip: true, _sheet_error: false } }];\n}\n\nconst meetingId = sourceData.meeting_id || sourceData.meeting_context?.meeting_id || '';\nconst requestId = sourceData.request_id || '';\n\nreturn actionItemRows.map((row, idx) => ({\n  json: {\n    ...row,\n    idempotency_key: `meeting:${meetingId}:request:${requestId}:action:${idx}`,\n    _idempotency_key: `meeting:${meetingId}:request:${requestId}:action:${idx}`,\n    _attempt: 1,\n    _max_attempts: 4,\n    _sheet_name: 'Action Items',\n    _skip: false\n  }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        944,
+        544
+      ],
+      "id": "68c95927-6adf-4869-a08c-9cf4cbaf5aa7",
+      "name": "Prepare Action Item Rows"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000004",
+              "leftValue": "={{ $json._skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1168,
+        544
+      ],
+      "id": "4c284092-e4fb-4d1b-ba48-a9bc227b742a",
+      "name": "Has Action Items?"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.DEVMEET_SPREADSHEET_ID }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 110857781,
+          "mode": "list",
+          "cachedResultName": "Action Items",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1M650KwhZoTSiesYkecuoTFF0aYc9OvUHRb2M8FPXvOA/edit#gid=110857781"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "meeting_id",
+              "displayName": "meeting_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "task",
+              "displayName": "task",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "assignee",
+              "displayName": "assignee",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "deadline",
+              "displayName": "deadline",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "evidence_timestamp",
+              "displayName": "evidence_timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1392,
+        448
+      ],
+      "id": "31649974-d209-4a51-93a0-a2a64c89a1ff",
+      "name": "3. Sheets - Append Action Items (Multiple Rows)",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "RAybACKg561af6JA",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function getSourceData() {\n  try {\n    const cachedNode = $('Extract & Format Cached AI Result');\n    if (cachedNode && cachedNode.item && cachedNode.item.json && !cachedNode.item.json.is_error) {\n      return cachedNode.item.json;\n    }\n  } catch (e) {}\n  try {\n    const chk1 = $('Check AI Output Valid #1');\n    if (chk1 && chk1.item && chk1.item.json && chk1.item.json.is_error) {\n      return $('Validate AI Retry Output').item.json;\n    }\n    return $('Validate Structured Output & Business Rules').item.json;\n  } catch (e) {}\n  return $json;\n}\n\nconst sourceData = getSourceData();\nconst actionItemRows = (sourceData.sheets_payload && sourceData.sheets_payload.action_item_rows) || [];\nconst items = $input.all();\nconst hasError = items.some(item => Boolean(item.json.error || item.json._sheet_error));\nconst attempt = items[0]?.json?._attempt || 1;\n\nif (hasError && attempt < 4) {\n  const backoffSeconds = attempt === 1 ? 5 : (attempt === 2 ? 15 : 30);\n  return actionItemRows.map((row, idx) => ({\n    json: {\n      ...row,\n      idempotency_key: `meeting:${sourceData.meeting_id}:request:${sourceData.request_id}:action:${idx}`,\n      _idempotency_key: `meeting:${sourceData.meeting_id}:request:${sourceData.request_id}:action:${idx}`,\n      _attempt: attempt + 1,\n      _max_attempts: 4,\n      _sheet_name: 'Action Items',\n      _wait_seconds: backoffSeconds,\n      _retry_needed: true,\n      _sheet_error: true\n    }\n  }));\n}\n\nreturn [{\n  json: {\n    _sheet_name: 'Action Items',\n    _retry_needed: false,\n    _sheet_error: hasError,\n    _error_message: hasError ? 'Failed to append Action Items sheet after retries.' : null\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        448
+      ],
+      "id": "11a10432-11f1-409e-a484-410f787e0766",
+      "name": "Check Action Items Append Result"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000008",
+              "leftValue": "={{ $json._retry_needed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1824,
+        448
+      ],
+      "id": "cf046c6a-b6cd-40b6-b6ab-615699a9dfb0",
+      "name": "Is Action Item Retry Needed?"
+    },
+    {
+      "parameters": {
+        "amount": "={{ $json._wait_seconds }}"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1600,
+        624
+      ],
+      "id": "fb711520-fb31-4dd2-8096-1d3852215f64",
+      "name": "Wait Action Item Retry",
+      "webhookId": "1263a474-8f27-40e2-a9b7-0ffc45a0adcc"
+    },
+    {
+      "parameters": {
+        "jsCode": "function getSourceData() {\n  try {\n    const cachedNode = $('Extract & Format Cached AI Result');\n    if (cachedNode && cachedNode.item && cachedNode.item.json && !cachedNode.item.json.is_error) {\n      return cachedNode.item.json;\n    }\n  } catch (e) {}\n  try {\n    const chk1 = $('Check AI Output Valid #1');\n    if (chk1 && chk1.item && chk1.item.json && chk1.item.json.is_error) {\n      return $('Validate AI Retry Output').item.json;\n    }\n    return $('Validate Structured Output & Business Rules').item.json;\n  } catch (e) {}\n  return $json;\n}\n\nconst sourceData = getSourceData();\nlet spreadsheetId = '1M650KwhZoTSiesYkecuoTFF0aYc9OvUHRb2M8FPXvOA';\ntry {\n  const envId = $env.DEVMEET_SPREADSHEET_ID;\n  if (envId) spreadsheetId = String(envId).trim();\n} catch (e) {}\n\nif (!spreadsheetId || !spreadsheetId.trim()) {\n  return [{\n    json: {\n      _skip: true,\n      _sheet_config_error: true,\n      _sheet_error: true,\n      _retry_needed: false,\n      _error_message: 'DEVMEET_SPREADSHEET_ID environment variable is missing or empty. Configuration error.'\n    }\n  }];\n}\n\nconst row = (sourceData.sheets_payload && sourceData.sheets_payload.email_row) || {};\nconst meetingId = sourceData.meeting_id || sourceData.meeting_context?.meeting_id || '';\nconst requestId = sourceData.request_id || '';\nconst idempotencyKey = `meeting:${meetingId}:request:${requestId}:email`;\n\nreturn [{\n  json: {\n    ...row,\n    idempotency_key: idempotencyKey,\n    _idempotency_key: idempotencyKey,\n    _attempt: 1,\n    _max_attempts: 4,\n    _sheet_name: 'Follow-up Emails',\n    _skip: false,\n    _sheet_error: false\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2048,
+        544
+      ],
+      "id": "ebba902c-5b6d-4ddc-89e3-facfd4313102",
+      "name": "Prepare Email Row"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.DEVMEET_SPREADSHEET_ID }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1330656966,
+          "mode": "list",
+          "cachedResultName": "Follow-up Emails",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1M650KwhZoTSiesYkecuoTFF0aYc9OvUHRb2M8FPXvOA/edit#gid=1330656966"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "meeting_id",
+              "displayName": "meeting_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "subject",
+              "displayName": "subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "body",
+              "displayName": "body",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2272,
+        544
+      ],
+      "id": "e91ccbda-b99c-429f-94c7-cfc70c735194",
+      "name": "4. Sheets - Append Follow-up Email",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "RAybACKg561af6JA",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function getSourceData() {\n  try {\n    const cachedNode = $('Extract & Format Cached AI Result');\n    if (cachedNode && cachedNode.item && cachedNode.item.json && !cachedNode.item.json.is_error) {\n      return cachedNode.item.json;\n    }\n  } catch (e) {}\n  try {\n    const chk1 = $('Check AI Output Valid #1');\n    if (chk1 && chk1.item && chk1.item.json && chk1.item.json.is_error) {\n      return $('Validate AI Retry Output').item.json;\n    }\n    return $('Validate Structured Output & Business Rules').item.json;\n  } catch (e) {}\n  return $json;\n}\n\nconst sourceData = getSourceData();\nconst emailRow = (sourceData.sheets_payload && sourceData.sheets_payload.email_row) || {};\nconst currentItem = $json;\nconst hasError = Boolean(currentItem.error || currentItem._sheet_error);\nconst attempt = currentItem._attempt || 1;\nconst idempotencyKey = currentItem._idempotency_key || `meeting:${sourceData.meeting_id}:request:${sourceData.request_id}:email`;\n\nif (hasError && attempt < 4) {\n  const backoffSeconds = attempt === 1 ? 5 : (attempt === 2 ? 15 : 30);\n  return [{\n    json: {\n      ...emailRow,\n      idempotency_key: idempotencyKey,\n      _idempotency_key: idempotencyKey,\n      _attempt: attempt + 1,\n      _max_attempts: 4,\n      _sheet_name: 'Follow-up Emails',\n      _wait_seconds: backoffSeconds,\n      _retry_needed: true,\n      _sheet_error: true\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    _sheet_name: 'Follow-up Emails',\n    _retry_needed: false,\n    _sheet_error: hasError,\n    _error_message: hasError ? String(currentItem.error?.message || currentItem._error_message || 'Email append failed after retries') : null\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        544
+      ],
+      "id": "7fec7a44-48bf-445e-b957-298069709e38",
+      "name": "Check Email Append Result"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000009",
+              "leftValue": "={{ $json._retry_needed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2704,
+        544
+      ],
+      "id": "3181978f-af3d-41c2-b247-abaad9e6640e",
+      "name": "Is Email Retry Needed?"
+    },
+    {
+      "parameters": {
+        "amount": "={{ $json._wait_seconds }}"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2480,
+        736
+      ],
+      "id": "af3a173b-46e5-43bf-a2d0-bd62c51a4a99",
+      "name": "Wait Email Retry",
+      "webhookId": "5e54d9ca-2f56-4fad-876f-79b5891483af"
+    },
+    {
+      "parameters": {
+        "jsCode": "function getSourceData() {\n  try {\n    const cachedNode = $('Extract & Format Cached AI Result');\n    if (cachedNode && cachedNode.item && cachedNode.item.json && !cachedNode.item.json.is_error) {\n      return cachedNode.item.json;\n    }\n  } catch (e) {}\n  try {\n    const chk1 = $('Check AI Output Valid #1');\n    if (chk1 && chk1.item && chk1.item.json && chk1.item.json.is_error) {\n      return $('Validate AI Retry Output').item.json;\n    }\n    return $('Validate Structured Output & Business Rules').item.json;\n  } catch (e) {}\n  return $json;\n}\n\nconst sourceData = getSourceData();\nconst meetingId = sourceData.meeting_id || sourceData.meeting_context?.meeting_id || '';\nconst requestId = sourceData.request_id || '';\nconst action = sourceData.action || 'AI_PROCESS';\nconst aiResult = sourceData.ai_output || sourceData.cached_ai_result || sourceData.ai_result || {};\nlet spreadsheetId = '1M650KwhZoTSiesYkecuoTFF0aYc9OvUHRb2M8FPXvOA';\ntry {\n  const envId = $env.DEVMEET_SPREADSHEET_ID;\n  if (envId) spreadsheetId = String(envId).trim();\n} catch (e) {}\n\n// Collect Sheets error statuses across all 4 stages\nconst errors = [];\n\ntry {\n  const prepMeet = $('Prepare Meeting Log Row').item.json;\n  if (prepMeet._sheet_config_error) errors.push(prepMeet._error_message || 'Missing DEVMEET_SPREADSHEET_ID');\n} catch (e) {}\n\ntry {\n  const meetChk = $('Check Meeting Append Result').item.json;\n  if (meetChk._sheet_error) errors.push(meetChk._error_message || 'Meeting append failed');\n} catch (e) {}\n\ntry {\n  const decChk = $('Check Decision Append Result').item.json;\n  if (decChk._sheet_error) errors.push(decChk._error_message || 'Decisions append failed');\n} catch (e) {}\n\ntry {\n  const actChk = $('Check Action Items Append Result').item.json;\n  if (actChk._sheet_error) errors.push(actChk._error_message || 'Action Items append failed');\n} catch (e) {}\n\ntry {\n  const emailChk = $('Check Email Append Result').item.json;\n  if (emailChk._sheet_error) errors.push(emailChk._error_message || 'Follow-up Email append failed');\n} catch (e) {}\n\nconst uniqueErrors = Array.from(new Set(errors));\nconst sheetsFailed = uniqueErrors.length > 0;\nconst sheetsSyncStatus = sheetsFailed ? 'FAILED' : 'SYNCED';\nconst overallStatus = sheetsFailed ? 'partial_success' : 'success';\n\nreturn [{\n  json: {\n    status: overallStatus,\n    meeting_id: meetingId,\n    request_id: requestId,\n    action: action,\n    google_sheets_url: sheetsFailed ? null : (spreadsheetId ? `https://docs.google.com/spreadsheets/d/${spreadsheetId}` : null),\n    ai_status: 'COMPLETED',\n    sheets_sync_status: sheetsSyncStatus,\n    sheets_error_warning: uniqueErrors.length > 0 ? uniqueErrors.join('; ') : null,\n    observability: {\n      provider: 'google',\n      model: 'gemini-3.6-flash',\n      duration_ms: Date.now() - (sourceData.start_timestamp || Date.now())\n    },\n    ai_output: {\n      summary: aiResult.summary || '',\n      key_points: aiResult.key_points || [],\n      decisions: aiResult.decisions || [],\n      action_items: aiResult.action_items || [],\n      follow_up_email: aiResult.follow_up_email || {}\n    }\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2928,
+        544
+      ],
+      "id": "6e21b2aa-7c9f-434e-b876-553d2150f57d",
+      "name": "Format Backend Response"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\n  \"status\": $json.status,\n  \"request_id\": $json.request_id,\n  \"meeting_id\": $json.meeting_id,\n  \"google_sheets_url\": $json.google_sheets_url,\n  \"ai_status\": $json.ai_status,\n  \"sheets_sync_status\": $json.sheets_sync_status,\n  \"sheets_error_warning\": $json.sheets_error_warning,\n  \"observability\": $json.observability,\n  \"ai_output\": $json.ai_output\n} }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        3152,
+        544
+      ],
+      "id": "1fbdd7d3-1729-4bd8-8d99-2c5f97c3ebce",
+      "name": "Respond to Webhook (Success/Partial)"
+    },
+    {
+      "parameters": {
+        "content": "## DEVMEET_Meeting_Processor_v3 — Architecture Verification\n\n### Key Capabilities:\n1. **Independent Google Sheets Retry x3:** Each sheet operation (Meetings, Decisions, Action Items, Follow-up Emails) has independent 3x retries with backoff (5s -> 15s -> 30s). Failure in one sheet does NOT re-run previous successful sheets or AI model.\n2. **Strict Task Validation:** `body.tasks` is strictly validated against `['summary', 'decisions', 'action_items', 'follow_up_email']`. Missing or invalid tasks immediately return `INVALID_INPUT` (no silent fallback/filtering).\n3. **Strict Output Validation & AI Retry x1:** Rejects invalid/malformed AI output; retries AI exactly 1 time with error context. If still invalid, responds with 502 `AI_OUTPUT_INVALID`.\n4. **Failure Isolation & Partial Success:** If all retries for sheets fail, returns `status: partial_success`, `sheets_sync_status: FAILED` with full `ai_output` preserved.\n5. **Webhook Authentication:** Verifies `X-Webhook-Secret` against `$env.DEVMEET_WEBHOOK_SECRET`.\n6. **Input Contract Validation:** `request_id` is STRICTLY REQUIRED (no auto-gen fallback).\n7. **Observability:** Tracks `execution_time_ms`, provider, model, preserved `request_id`.",
+        "height": 480,
+        "width": 800,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2672,
+        848
+      ],
+      "id": "e63f449d-3be9-4686-bbd3-00dd83d58eb7",
+      "name": "NOTE - v3 Architecture Summary"
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n  \"summary\": \"Tóm tắt nội dung cuộc họp bằng tiếng Việt...\",\n  \"key_points\": [\n    \"Điểm kỹ thuật quan trọng 1 (Tiếng Việt)\",\n    \"Điểm kỹ thuật quan trọng 2 (Tiếng Việt)\"\n  ],\n  \"decisions\": [\n    {\n      \"decision\": \"Quyết định kỹ thuật đã thống nhất (Tiếng Việt)\",\n      \"context\": \"Bối cảnh quyết định (Tiếng Việt)\",\n      \"evidence_timestamp\": \"09:15:10\"\n    }\n  ],\n  \"action_items\": [\n    {\n      \"task\": \"Nhiệm vụ cụ thể cần thực hiện (Tiếng Việt)\",\n      \"assignee\": \"Nguyen Van A\",\n      \"deadline\": \"2026-08-22\",\n      \"status\": \"TODO\",\n      \"evidence_timestamp\": \"09:20:05\"\n    }\n  ],\n  \"follow_up_email\": {\n    \"subject\": \"[DevMeet AI] Tóm tắt cuộc họp & Kế hoạch hành động\",\n    \"body\": \"Chào mọi người,\\n\\nDưới đây là tóm tắt nội dung và các việc cần làm sau cuộc họp...\"\n  }\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -928,
+        224
+      ],
+      "id": "39f31dca-ca68-4fb6-83f0-5e9fb17bc75d",
+      "name": "Structured Output Parser 2"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000010",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "AI_PROCESS",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1968,
+        352
+      ],
+      "id": "5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d",
+      "name": "Check Action Router"
+    },
+    {
+      "parameters": {
+        "jsCode": "const inputData = $json;\nconst cached = inputData.cached_ai_result || {};\n\nconst meetingRow = {\n  meeting_id: inputData.meeting_id,\n  date: inputData.meeting_date,\n  title: inputData.meeting_title,\n  summary: String(cached.summary || '').trim(),\n  created_at: new Date().toISOString(),\n  idempotency_key: `meeting:${inputData.meeting_id}:request:${inputData.request_id}:meeting`\n};\n\nconst decisionRows = Array.isArray(cached.decisions)\n  ? cached.decisions.map((d, idx) => ({\n      meeting_id: inputData.meeting_id,\n      decision: String(d.decision || '').trim(),\n      context: String(d.context || '').trim(),\n      evidence_timestamp: String(d.evidence_timestamp || '').trim(),\n      idempotency_key: `meeting:${inputData.meeting_id}:request:${inputData.request_id}:decision:${idx}`\n    }))\n  : [];\n\nconst actionItemRows = Array.isArray(cached.action_items)\n  ? cached.action_items.map((a, idx) => ({\n      meeting_id: inputData.meeting_id,\n      task: String(a.task || '').trim(),\n      assignee: a.assignee ? String(a.assignee).trim() : 'Unassigned',\n      deadline: a.deadline ? String(a.deadline).trim() : 'None',\n      status: 'TODO',\n      evidence_timestamp: String(a.evidence_timestamp || '').trim(),\n      idempotency_key: `meeting:${inputData.meeting_id}:request:${inputData.request_id}:action:${idx}`\n    }))\n  : [];\n\nconst emailObj = cached.follow_up_email || {};\nconst emailRow = {\n  meeting_id: inputData.meeting_id,\n  subject: String(emailObj.subject || '').trim(),\n  body: String(emailObj.body || '').trim(),\n  idempotency_key: `meeting:${inputData.meeting_id}:request:${inputData.request_id}:email`\n};\n\nreturn [{\n  json: {\n    is_error: false,\n    retry_needed: false,\n    action: 'SHEETS_RETRY',\n    request_id: inputData.request_id,\n    meeting_id: inputData.meeting_id,\n    meeting_title: inputData.meeting_title,\n    meeting_date: inputData.meeting_date,\n    start_timestamp: inputData.start_timestamp,\n    ai_output: cached,\n    sheets_payload: {\n      meeting_row: meetingRow,\n      decision_rows: decisionRows,\n      action_item_rows: actionItemRows,\n      email_row: emailRow\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1488,
+        544
+      ],
+      "id": "7b8a9c0d-1e2f-3a4b-5c6d-7e8f9a0b1c2d",
+      "name": "Extract & Format Cached AI Result"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=BẮT BUỘC: TOÀN BỘ NỘI DUNG ĐẦU RA (TẤT CẢ CÁC TRƯỜNG SUMMARY, KEY_POINTS, DECISIONS, ACTION_ITEMS, FOLLOW_UP_EMAIL) BẮT BUỘC PHẢI VIẾT BẰNG TIẾNG VIỆT (VIETNAMESE). TUYỆT ĐỐI KHÔNG ĐƯỢC DÙNG TIẾNG ANH (trừ thuật ngữ CNTT như API, Deploy, Backend...).\n\nBạn là DevMeet AI, chuyên gia AI phân tích cuộc họp kỹ thuật trong lĩnh vực Công nghệ Thông tin và Phát triển Phần mềm.\n\nNhiệm vụ: Phân tích nội dung transcript cuộc họp và xuất DUY NHẤT một JSON Object theo đúng schema được yêu cầu.\n\nBối cảnh cuộc họp:\n- Request ID: {{ $json.request_id }}\n- Meeting ID: {{ $json.meeting_id }}\n- Tiêu đề: {{ $json.meeting_title }}\n- Ngày họp: {{ $json.meeting_date }}\n- Nhiệm vụ cần làm: {{ JSON.stringify($json.tasks) }}\n- Danh sách người tham gia: {{ JSON.stringify($json.participants) }}\n\nNội dung Transcript:\n{{ $json.transcript_prompt_text }}\n\nQUY TẮC BẮT BUỘC (VI PHẠM SẼ BỊ COI LÀ LỖI):\n1. NGÔN NGỮ BẮT BUỘC: 100% TIẾNG VIỆT. Tất cả các giá trị văn bản trong JSON (summary, key_points, decision, context, task, follow_up_email.subject, follow_up_email.body) PHẢI LÀ TIẾNG VIỆT. KHÔNG ĐƯỢC VIẾT TIẾNG ANH.\n2. TUYỆT ĐỐI KHÔNG BỊA ĐẶT (NO HALLUCINATION): Chỉ trích xuất thông tin, dữ kiện có trong transcript.\n3. Summary: Tóm tắt kỹ thuật súc tích (3-6 câu) bằng tiếng Việt nêu rõ bối cảnh, các chủ đề chính và kết quả.\n4. Key Points: Mảng 3-6 chuỗi tóm tắt các điểm nhấn quan trọng bằng tiếng Việt.\n5. Decisions: Mảng các quyết định kỹ thuật bằng tiếng Việt. Mỗi quyết định gồm 'decision' (tiếng Việt), 'context' (tiếng Việt) và 'evidence_timestamp' (từ transcript). Nếu không có, trả về [].\n6. Action Items: Mảng các đầu việc cần làm bằng tiếng Việt. Mỗi mục gồm 'task' (tiếng Việt), 'assignee' (từ danh sách participants hoặc null), 'deadline' (hoặc null), 'status' ('TODO'), và 'evidence_timestamp' (bắt buộc). Nếu không có việc nào, trả về [].\n7. Follow-up Email: Soạn email hoàn chỉnh bằng tiếng Việt gồm 'subject' và 'body' tóm tắt kết quả cuộc họp.\n8. Trả về DUY NHẤT chuỗi JSON hợp lệ khớp schema, không có giải thích hay markdown code fence thừa.",
+        "hasOutputParser": true,
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        -1664,
+        272
+      ],
+      "id": "e20f36c3-387e-4ec8-893e-64f26737b2e5",
+      "name": "Analyze Meeting - Gemini LLM Chain",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=BẮT BUỘC: TOÀN BỘ ĐẦU RA PHẢI VIẾT BẰNG TIẾNG VIỆT 100%.\n\nBạn là DevMeet AI. Lần phân tích trước đó chưa hợp lệ với lỗi: {{ $json.validation_error_message }}.\n\nHãy phân tích lại transcript cuộc họp và xuất DUY NHẤT một JSON Object CHÍNH XÁC theo schema bằng TIẾNG VIỆT.\n\nBối cảnh cuộc họp:\n- Request ID: {{ $json.request_id }}\n- Meeting ID: {{ $json.meeting_id }}\n- Tiêu đề: {{ $json.meeting_title }}\n- Ngày họp: {{ $json.meeting_date }}\n- Nhiệm vụ: {{ JSON.stringify($json.tasks) }}\n- Người tham gia: {{ JSON.stringify($json.participants) }}\n\nNội dung Transcript:\n{{ $json.transcript_prompt_text }}\n\nQUY TẮC BẮT BUỘC:\n1. NGÔN NGỮ: 100% TIẾNG VIỆT cho mọi trường văn bản.\n2. Decisions: BẮT BUỘC có 'decision', 'context' và 'evidence_timestamp' (từ transcript).\n3. Action Items: BẮT BUỘC có 'task', 'status' ('TODO') và 'evidence_timestamp' (từ transcript).\n4. Follow-up Email: BẮT BUỘC có 'subject' và 'body' bằng tiếng Việt.\n5. Trả về DUY NHẤT JSON hợp lệ.",
+        "hasOutputParser": true,
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        -1056,
+        0
+      ],
+      "id": "c325affe-7f19-40af-a5ca-36d56cca9d1c",
+      "name": "AI Retry #1 - Gemini LLM Chain",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.5-flash-lite",
+        "options": {
+          "temperature": 0.1
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -1632,
+        416
+      ],
+      "id": "d0590a36-3ec5-407b-8ae3-5a08207908b2",
+      "name": "AI Model Provider - Google Gemini",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "sQ2vH9OUpJRTP8EF",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.5-flash-lite",
+        "options": {
+          "temperature": 0.1
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -1056,
+        256
+      ],
+      "id": "b4a39049-ca77-4409-afc3-559d7ffbe616",
+      "name": "AI Model Provider - Google Gemini Retry",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "sQ2vH9OUpJRTP8EF",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000011",
+              "leftValue": "={{ $json._skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c1d2e3f4-0000-4000-8000-000000000011",
+      "name": "Has Meeting to Append?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1808,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1d2e3f4-0001-4000-8000-000000000012",
+              "leftValue": "={{ $json._skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c1d2e3f4-0000-4000-8000-000000000012",
+      "name": "Has Email to Append?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        368
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook - Meeting AI Request": {
+      "main": [
+        [
+          {
+            "node": "Authenticate & Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Authenticate & Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Check Request Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Request Valid": {
+      "main": [
+        [
+          {
+            "node": "Respond - Validation/Auth Error",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Check Action Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Analyze Meeting - Gemini LLM Chain",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Structured Output & Business Rules": {
+      "main": [
+        [
+          {
+            "node": "Check AI Output Valid #1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check AI Output Valid #1": {
+      "main": [
+        [
+          {
+            "node": "AI Retry #1 - Gemini LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Meeting Log Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate AI Retry Output": {
+      "main": [
+        [
+          {
+            "node": "Check AI Retry Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check AI Retry Valid": {
+      "main": [
+        [
+          {
+            "node": "Respond - AI Processing Error",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Meeting Log Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Meeting Log Row": {
+      "main": [
+        [
+          {
+            "node": "Has Meeting to Append?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1. Sheets - Append Meeting": {
+      "main": [
+        [
+          {
+            "node": "Check Meeting Append Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Meeting Append Result": {
+      "main": [
+        [
+          {
+            "node": "Is Meeting Retry Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Meeting Retry Needed?": {
+      "main": [
+        [
+          {
+            "node": "Wait Meeting Retry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Decision Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Meeting Retry": {
+      "main": [
+        [
+          {
+            "node": "1. Sheets - Append Meeting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Decision Rows": {
+      "main": [
+        [
+          {
+            "node": "Has Decisions?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Decisions?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Action Item Rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "2. Sheets - Append Decisions (Multiple Rows)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. Sheets - Append Decisions (Multiple Rows)": {
+      "main": [
+        [
+          {
+            "node": "Check Decision Append Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Decision Append Result": {
+      "main": [
+        [
+          {
+            "node": "Is Decision Retry Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Decision Retry Needed?": {
+      "main": [
+        [
+          {
+            "node": "Wait Decision Retry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Action Item Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Decision Retry": {
+      "main": [
+        [
+          {
+            "node": "2. Sheets - Append Decisions (Multiple Rows)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Action Item Rows": {
+      "main": [
+        [
+          {
+            "node": "Has Action Items?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Action Items?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Email Row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "3. Sheets - Append Action Items (Multiple Rows)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. Sheets - Append Action Items (Multiple Rows)": {
+      "main": [
+        [
+          {
+            "node": "Check Action Items Append Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Action Items Append Result": {
+      "main": [
+        [
+          {
+            "node": "Is Action Item Retry Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Action Item Retry Needed?": {
+      "main": [
+        [
+          {
+            "node": "Wait Action Item Retry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Email Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Action Item Retry": {
+      "main": [
+        [
+          {
+            "node": "3. Sheets - Append Action Items (Multiple Rows)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Email Row": {
+      "main": [
+        [
+          {
+            "node": "Has Email to Append?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4. Sheets - Append Follow-up Email": {
+      "main": [
+        [
+          {
+            "node": "Check Email Append Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Email Append Result": {
+      "main": [
+        [
+          {
+            "node": "Is Email Retry Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Email Retry Needed?": {
+      "main": [
+        [
+          {
+            "node": "Wait Email Retry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Backend Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Email Retry": {
+      "main": [
+        [
+          {
+            "node": "4. Sheets - Append Follow-up Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Backend Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook (Success/Partial)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser 2": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Retry #1 - Gemini LLM Chain",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Action Router": {
+      "main": [
+        [
+          {
+            "node": "Analyze Meeting - Gemini LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extract & Format Cached AI Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract & Format Cached AI Result": {
+      "main": [
+        [
+          {
+            "node": "Prepare Meeting Log Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Model Provider - Google Gemini": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Analyze Meeting - Gemini LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Meeting - Gemini LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Validate Structured Output & Business Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Model Provider - Google Gemini Retry": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Retry #1 - Gemini LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Retry #1 - Gemini LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Validate AI Retry Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Meeting to Append?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Decision Rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "1. Sheets - Append Meeting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Email to Append?": {
+      "main": [
+        [
+          {
+            "node": "Format Backend Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "4. Sheets - Append Follow-up Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
