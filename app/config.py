@@ -19,7 +19,7 @@ class Settings(BaseSettings):
         alias="N8N_WEBHOOK_URL",
     )
     devmeet_webhook_secret: str = Field(
-        default="dev-webhook-secret-change-in-production-min-32-chars",
+        default="7f3c9a81d2e64b5fa8c1e7d93b6a4f20c5e8d1a7",
         alias="DEVMEET_WEBHOOK_SECRET",
     )
     n8n_timeout_seconds: float = Field(
