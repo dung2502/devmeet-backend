@@ -8,8 +8,7 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user
 from app.database import get_db
 from app.main import app
-from app.models import Meeting, User
-from app.repositories import MeetingRepository, UserRepository
+from app.repositories import MeetingAccessRepository, MeetingRepository, UserRepository
 
 
 @pytest.fixture()
@@ -178,3 +177,50 @@ def test_export_user_isolation(auth_setup):
 
     res = client.get(f"/api/v1/meetings/{m_b.id}/export?type=transcript")
     assert res.status_code == 404
+
+
+def test_export_participant_allowed(auth_setup):
+    client = auth_setup["client"]
+    user_a = auth_setup["user_a"]
+    user_b = auth_setup["user_b"]
+    set_user = auth_setup["set_user"]
+    session = auth_setup["session"]
+
+    # User A creates meeting
+    m = MeetingRepository(session).create(
+        {
+            "user_id": user_a.id,
+            "title": "Cuộc họp Nhóm",
+            "start_time": datetime(2026, 9, 15, 14, 30, tzinfo=timezone.utc),
+            "dom_capture_status": "captured",
+            "dom_transcript_data": [
+                {"speaker": "Nguyen Van A", "text": "Chung ta bat dau cuoc hop.", "start_time": "00:01:04"},
+            ],
+            "ai_status": "COMPLETED",
+            "ai_result": {"summary": "Tóm tắt cuộc họp nhóm."},
+        }
+    )
+
+    # Grant User B participant access
+    MeetingAccessRepository(session).add_or_update_access(m.id, user_b.id, role="PARTICIPANT")
+    session.commit()
+
+    # Switch current user to User B (participant / "Tôi tham gia")
+    set_user(user_b)
+
+    # Participant exporting transcript
+    res_transcript = client.get(f"/api/v1/meetings/{m.id}/export?type=transcript")
+    assert res_transcript.status_code == 200
+    assert "DEVMEETING AI — TRANSCRIPT" in res_transcript.text
+    assert "Nguyen Van A: Chung ta bat dau cuoc hop." in res_transcript.text
+
+    # Participant exporting summary
+    res_summary = client.get(f"/api/v1/meetings/{m.id}/export?type=summary")
+    assert res_summary.status_code == 200
+    assert "Tóm tắt cuộc họp nhóm." in res_summary.text
+
+    # Participant exporting all
+    res_all = client.get(f"/api/v1/meetings/{m.id}/export?type=all")
+    assert res_all.status_code == 200
+    assert "Tóm tắt cuộc họp nhóm." in res_all.text
+

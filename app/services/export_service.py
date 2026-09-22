@@ -6,6 +6,7 @@ from typing import Literal
 from sqlalchemy.orm import Session
 
 from app.models import Meeting
+from app.repositories.meeting_access_repository import MeetingAccessRepository
 from app.services.participant_sync import MeetingNotFoundError
 from app.services.transcript_source_selector import TranscriptSourceSelector
 from app.services.transcript_view_service import TranscriptViewService
@@ -34,6 +35,7 @@ class ExportService:
         self.session = session
         self.selector = TranscriptSourceSelector(session)
         self.view_service = TranscriptViewService(session)
+        self.access_repo = MeetingAccessRepository(session)
 
     def export_meeting(
         self,
@@ -49,8 +51,10 @@ class ExportService:
         if meeting is None:
             raise MeetingNotFoundError(f"Meeting with id {meeting_id} not found.")
 
-        if user_id is not None and meeting.user_id != user_id:
-            raise MeetingNotFoundError(f"Meeting with id {meeting_id} not found.")
+        if user_id is not None:
+            user_role = self.access_repo.get_user_role(meeting_id, user_id)
+            if meeting.user_id != user_id and user_role is None:
+                raise MeetingNotFoundError(f"Meeting with id {meeting_id} not found.")
 
         title = meeting.title or "Cuộc họp"
         safe_title = sanitize_filename(title)
@@ -61,7 +65,7 @@ class ExportService:
         )
 
         if export_type == "transcript":
-            content = self._format_transcript(meeting_id, meeting)
+            content = self._format_transcript(meeting_id, meeting, user_id=user_id)
             filename = f"Transcript_{safe_title}_{date_str}.txt"
             return content, filename
 
@@ -71,14 +75,14 @@ class ExportService:
             return content, filename
 
         if export_type == "all":
-            content = self._format_all(meeting_id, meeting)
+            content = self._format_all(meeting_id, meeting, user_id=user_id)
             filename = f"Full_Meeting_Report_{safe_title}_{date_str}.txt"
             return content, filename
 
         raise ValueError(f"Invalid export type: {export_type}")
 
-    def _format_transcript(self, meeting_id: uuid.UUID, meeting: Meeting) -> str:
-        view = self.view_service.get_transcript_view(meeting_id)
+    def _format_transcript(self, meeting_id: uuid.UUID, meeting: Meeting, user_id: uuid.UUID | None = None) -> str:
+        view = self.view_service.get_transcript_view(meeting_id, user_id=user_id)
         lines = [
             f"DEVMEETING AI — TRANSCRIPT",
             f"==========================",
@@ -161,9 +165,9 @@ class ExportService:
 
         return "\n".join(lines)
 
-    def _format_all(self, meeting_id: uuid.UUID, meeting: Meeting) -> str:
+    def _format_all(self, meeting_id: uuid.UUID, meeting: Meeting, user_id: uuid.UUID | None = None) -> str:
         summary_part = self._format_summary(meeting)
-        transcript_part = self._format_transcript(meeting_id, meeting)
+        transcript_part = self._format_transcript(meeting_id, meeting, user_id=user_id)
 
         return (
             summary_part
