@@ -24,6 +24,7 @@ from app.schemas.meeting import (
     MeetingListResponse,
     MeetingResponse,
     MeetingSyncRequest,
+    MeetingUpdateRequest,
 )
 from app.schemas.transcript_view import TranscriptViewResponse
 from app.services.conference_record_sync import ConferenceRecordSyncService
@@ -336,6 +337,50 @@ def get_meeting(
         created_at=meeting.created_at,
         updated_at=meeting.updated_at,
     )
+
+
+@router.patch("/{meeting_id}", response_model=MeetingDetailResponse, status_code=status.HTTP_200_OK)
+def update_meeting_title(
+    meeting_id: uuid.UUID,
+    payload: MeetingUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Any:
+    """
+    Update meeting title.
+    Enforces strict RBAC: Only the meeting OWNER or user with role 'OWNER'/'host'
+    can rename the meeting.
+    """
+    from app.repositories.meeting_access_repository import MeetingAccessRepository
+
+    meeting_repo = MeetingRepository(db)
+    access_repo = MeetingAccessRepository(db)
+
+    meeting = meeting_repo.get_by_id(meeting_id)
+    if meeting is None:
+        raise MeetingNotFoundError(f"Meeting with id {meeting_id} not found.")
+
+    user_role = access_repo.get_user_role(meeting_id, current_user.id)
+    is_owner = (meeting.user_id == current_user.id) or (user_role in ("OWNER", "host"))
+
+    if not is_owner:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Chỉ chủ phòng mới có quyền đổi tên cuộc họp.",
+        )
+
+    new_title = payload.title.strip()
+    if not new_title:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tiêu đề cuộc họp không được để trống.",
+        )
+
+    meeting.title = new_title
+    db.commit()
+    db.refresh(meeting)
+
+    return get_meeting(meeting_id=meeting_id, current_user=current_user, db=db)
 
 
 @router.get(

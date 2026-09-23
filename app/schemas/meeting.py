@@ -16,6 +16,10 @@ class MeetingSyncRequest(BaseModel):
     user_id: uuid.UUID | None = None
 
 
+class MeetingUpdateRequest(BaseModel):
+    title: str
+
+
 class MeetingResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

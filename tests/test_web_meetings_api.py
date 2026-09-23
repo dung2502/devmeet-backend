@@ -244,3 +244,50 @@ def test_get_meeting_detail_with_dom_speakers_resolution(auth_setup):
     item = next(it for it in res_list.json()["items"] if it["id"] == str(m.id))
     assert item["participant_count"] == 1
 
+
+def test_update_meeting_title_rbac(auth_setup):
+    client = auth_setup["client"]
+    user_a = auth_setup["user_a"]
+    user_b = auth_setup["user_b"]
+    session = auth_setup["session"]
+    m_repo = MeetingRepository(session)
+
+    # User A creates meeting (owner)
+    m = m_repo.create(
+        {
+            "user_id": user_a.id,
+            "title": "Old Standup Title",
+            "status": "completed",
+        }
+    )
+
+    # 1. User A (Owner) can rename meeting
+    res_update = client.patch(
+        f"/api/v1/meetings/{m.id}",
+        json={"title": "New Sprint Retrospective"},
+    )
+    assert res_update.status_code == 200
+    assert res_update.json()["title"] == "New Sprint Retrospective"
+
+    # 2. Empty title validation fails
+    res_empty = client.patch(
+        f"/api/v1/meetings/{m.id}",
+        json={"title": "   "},
+    )
+    assert res_empty.status_code == 400
+
+    # 3. User B (Participant / Non-Owner) is forbidden from renaming
+    auth_setup["set_user"](user_b)
+    from app.repositories.meeting_access_repository import MeetingAccessRepository
+    access_repo = MeetingAccessRepository(session)
+    access_repo.add_or_update_access(m.id, user_b.id, role="PARTICIPANT")
+    session.commit()
+
+    res_forbidden = client.patch(
+        f"/api/v1/meetings/{m.id}",
+        json={"title": "Hacked Title By Participant"},
+    )
+    assert res_forbidden.status_code == 403
+    assert "Chỉ chủ phòng" in res_forbidden.json()["detail"]
+
+
