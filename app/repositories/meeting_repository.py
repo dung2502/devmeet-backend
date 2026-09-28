@@ -101,6 +101,7 @@ class MeetingRepository:
         self,
         meeting_code: str,
         window_minutes: int = 60,
+        platform: str | None = None,
     ) -> Meeting | None:
         """
         Finds an active shared meeting matching a meeting_code / space_name within the active window.
@@ -109,13 +110,18 @@ class MeetingRepository:
         if not meeting_code:
             return None
         clean_code = meeting_code.strip()
+        conditions = [
+            (Meeting.conference_identity == clean_code)
+            | (Meeting.conference_identity == f"zoom_{clean_code}")
+            | (Meeting.meeting_space_name == clean_code)
+            | (Meeting.meeting_url.ilike(f"%{clean_code}%"))
+        ]
+        if platform:
+            conditions.append(Meeting.platform == platform)
+
         stmt = (
             select(Meeting)
-            .where(
-                (Meeting.conference_identity == clean_code)
-                | (Meeting.meeting_space_name == clean_code)
-                | (Meeting.meeting_url.ilike(f"%{clean_code}%"))
-            )
+            .where(*conditions)
             .where(Meeting.status == "in_progress")
             .order_by(Meeting.created_at.desc())
         )

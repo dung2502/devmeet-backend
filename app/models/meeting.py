@@ -30,6 +30,7 @@ class Meeting(Base):
             unique=True,
             postgresql_where=text("status = 'in_progress' AND conference_identity IS NOT NULL"),
         ),
+        Index("idx_meetings_platform", "platform"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -98,6 +99,11 @@ class Meeting(Base):
         nullable=True,
     )
     conference_identity: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    platform: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        server_default="GOOGLE_MEET",
+    )
     grace_period_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
@@ -133,6 +139,17 @@ class Meeting(Base):
 
     @property
     def meeting_code(self) -> str | None:
+        if getattr(self, "platform", "GOOGLE_MEET") == "ZOOM_WEB" or (self.conference_identity and self.conference_identity.startswith("zoom_")):
+            if self.conference_identity and self.conference_identity.startswith("zoom_"):
+                return self.conference_identity[5:]
+            if self.meeting_url:
+                import re
+                match = re.search(r"/(?:wc|j)(?:/join)?/(\d{9,11})", self.meeting_url)
+                if match:
+                    return match.group(1)
+            if self.meeting_space_name and self.meeting_space_name.isdigit():
+                return self.meeting_space_name.strip()
+
         if self.meeting_space_name and "/" in self.meeting_space_name:
             return self.meeting_space_name.split("/")[-1].strip()
         if self.meeting_space_name:

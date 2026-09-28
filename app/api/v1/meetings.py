@@ -187,8 +187,9 @@ def list_meetings(
         entry_count = count_meeting_transcript_entries(m, db)
         code = m.meeting_code
         norm_title = m.title
-        if not norm_title or norm_title.strip().lower() in ("meet", "google meet", "google meet session"):
-            norm_title = f"Meet - {code}" if code else "Meet"
+        prefix = "Zoom" if getattr(m, "platform", "GOOGLE_MEET") == "ZOOM_WEB" else "Meet"
+        if not norm_title or norm_title.strip().lower() in ("meet", "google meet", "google meet session", "zoom", "zoom meeting", "zoom session", "zoom web client"):
+            norm_title = f"{prefix} - {code}" if code else prefix
 
         user_role_db = access_repo.get_user_role(m.id, current_user.id)
         calculated_role = "OWNER" if m.user_id == current_user.id else (user_role_db or "PARTICIPANT")
@@ -215,6 +216,7 @@ def list_meetings(
                 transcript_entry_count=entry_count,
                 user_role=calculated_role,
                 host_name=host_name,
+                platform=getattr(m, "platform", "GOOGLE_MEET"),
                 created_at=m.created_at,
                 updated_at=m.updated_at,
             )
@@ -252,6 +254,8 @@ def sync_meeting(
         start_time=payload.start_time,
         end_time=payload.end_time,
         meeting_id=payload.meeting_id,
+        platform=payload.platform,
+        meeting_code=payload.meeting_code,
     )
 
     token = x_google_access_token or access_token
@@ -303,8 +307,9 @@ def get_meeting(
 
     code = meeting.meeting_code
     norm_title = meeting.title
-    if not norm_title or norm_title.strip().lower() in ("meet", "google meet", "google meet session"):
-        norm_title = f"Meet - {code}" if code else "Meet"
+    prefix = "Zoom" if getattr(meeting, "platform", "GOOGLE_MEET") == "ZOOM_WEB" else "Meet"
+    if not norm_title or norm_title.strip().lower() in ("meet", "google meet", "google meet session", "zoom", "zoom meeting", "zoom session", "zoom web client"):
+        norm_title = f"{prefix} - {code}" if code else prefix
 
     calculated_role = "OWNER" if meeting.user_id == current_user.id else (user_role or "PARTICIPANT")
     host_name = meeting.user.display_name or meeting.user.email if meeting.user else None
@@ -334,6 +339,7 @@ def get_meeting(
         transcript_entry_count=entry_count,
         user_role=calculated_role,
         host_name=host_name,
+        platform=getattr(meeting, "platform", "GOOGLE_MEET"),
         created_at=meeting.created_at,
         updated_at=meeting.updated_at,
     )

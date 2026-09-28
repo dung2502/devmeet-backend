@@ -9,11 +9,13 @@ class MeetingSyncRequest(BaseModel):
     conference_record_name: str | None = None
     meeting_id: uuid.UUID | None = None
     meeting_space_name: str | None = None
+    meeting_code: str | None = None
     meeting_url: str | None = None
     title: str | None = None
     start_time: datetime | None = None
     end_time: datetime | None = None
     user_id: uuid.UUID | None = None
+    platform: str = "GOOGLE_MEET"
 
 
 class MeetingUpdateRequest(BaseModel):
@@ -36,6 +38,7 @@ class MeetingResponse(BaseModel):
     ai_status: str
     sheets_sync_status: str
     dom_capture_status: str
+    platform: str = "GOOGLE_MEET"
     created_at: datetime
     updated_at: datetime
 
@@ -62,6 +65,7 @@ class MeetingListItemResponse(BaseModel):
     transcript_entry_count: int = 0
     user_role: str = "OWNER"
     host_name: str | None = None
+    platform: str = "GOOGLE_MEET"
     created_at: datetime
     updated_at: datetime
 
@@ -99,6 +103,7 @@ class MeetingDetailResponse(BaseModel):
     transcript_entry_count: int = 0
     user_role: str = "OWNER"
     host_name: str | None = None
+    platform: str = "GOOGLE_MEET"
     created_at: datetime
     updated_at: datetime
 
