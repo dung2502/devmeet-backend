@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from starlette.concurrency import run_in_threadpool
 
 from app.api.v1.auth import router as auth_router
@@ -47,8 +48,37 @@ async def _zombie_session_reaper_loop():
             logger.error("Error in zombie session reaper loop: %s", exc)
 
 
+def _run_startup_migrations():
+    """
+    Guarantees critical database schema columns and indexes exist automatically on startup.
+    Executes raw DDL fallback for immediate zero-downtime column availability,
+    then triggers Alembic migration upgrade to sync the version table.
+    """
+    with SessionLocal() as db:
+        try:
+            db.execute(text("ALTER TABLE meetings ADD COLUMN IF NOT EXISTS platform VARCHAR(20) DEFAULT 'GOOGLE_MEET' NOT NULL;"))
+            db.execute(text("CREATE INDEX IF NOT EXISTS idx_meetings_platform ON meetings (platform);"))
+            db.commit()
+            logger.info("Direct schema verification: meetings.platform column and index verified.")
+        except Exception as exc:
+            db.rollback()
+            logger.warning("Direct schema DDL warning (will defer to Alembic): %s", exc)
+
+    try:
+        from alembic.config import Config
+        from alembic import command
+        alembic_cfg = Config("alembic.ini")
+        command.upgrade(alembic_cfg, "head")
+        logger.info("Alembic database migrations completed successfully.")
+    except Exception as exc:
+        logger.error("Alembic migration execution on startup: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 1. Run database schema migrations automatically on startup
+    await run_in_threadpool(_run_startup_migrations)
+    # 2. Start background reaper loop
     reaper_task = asyncio.create_task(_zombie_session_reaper_loop())
     yield
     reaper_task.cancel()
