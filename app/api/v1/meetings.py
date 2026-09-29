@@ -187,8 +187,19 @@ def list_meetings(
         entry_count = count_meeting_transcript_entries(m, db)
         code = m.meeting_code
         norm_title = m.title
-        prefix = "Zoom" if getattr(m, "platform", "GOOGLE_MEET") == "ZOOM_WEB" else "Meet"
-        if not norm_title or norm_title.strip().lower() in ("meet", "google meet", "google meet session", "zoom", "zoom meeting", "zoom session", "zoom web client"):
+        if getattr(m, "platform", "GOOGLE_MEET") == "MS_TEAMS":
+            prefix = "Teams"
+        elif getattr(m, "platform", "GOOGLE_MEET") == "ZOOM_WEB":
+            prefix = "Zoom"
+        else:
+            prefix = "Meet"
+
+        generic_prefixes = (
+            "meet", "google meet", "google meet session",
+            "zoom", "zoom meeting", "zoom session", "zoom web client",
+            "teams", "microsoft teams", "microsoft teams meeting", "teams meeting", "teams session",
+        )
+        if not norm_title or norm_title.strip().lower() in generic_prefixes:
             norm_title = f"{prefix} - {code}" if code else prefix
 
         user_role_db = access_repo.get_user_role(m.id, current_user.id)
@@ -307,8 +318,19 @@ def get_meeting(
 
     code = meeting.meeting_code
     norm_title = meeting.title
-    prefix = "Zoom" if getattr(meeting, "platform", "GOOGLE_MEET") == "ZOOM_WEB" else "Meet"
-    if not norm_title or norm_title.strip().lower() in ("meet", "google meet", "google meet session", "zoom", "zoom meeting", "zoom session", "zoom web client"):
+    if getattr(meeting, "platform", "GOOGLE_MEET") == "MS_TEAMS":
+        prefix = "Teams"
+    elif getattr(meeting, "platform", "GOOGLE_MEET") == "ZOOM_WEB":
+        prefix = "Zoom"
+    else:
+        prefix = "Meet"
+
+    generic_prefixes = (
+        "meet", "google meet", "google meet session",
+        "zoom", "zoom meeting", "zoom session", "zoom web client",
+        "teams", "microsoft teams", "microsoft teams meeting", "teams meeting", "teams session",
+    )
+    if not norm_title or norm_title.strip().lower() in generic_prefixes:
         norm_title = f"{prefix} - {code}" if code else prefix
 
     calculated_role = "OWNER" if meeting.user_id == current_user.id else (user_role or "PARTICIPANT")

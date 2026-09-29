@@ -1,8 +1,9 @@
+import hashlib
 import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -14,7 +15,7 @@ from app.repositories import MeetingAccessRepository, MeetingRepository
 
 class ConferenceIdentityResolver:
     """
-    Multi-Tier Conference Identity Resolution Service supporting Multi-Platform (Google Meet & Zoom Web).
+    Multi-Tier Conference Identity Resolution Service supporting Multi-Platform (Google Meet, Zoom Web & MS Teams).
     Resolves client sync requests to a single canonical Shared Room meeting_id:
     - Tier 1: Strong Identity (conference_record_name match)
     - Tier 2: Contextual Identity (meeting_space_name / meeting_code in active window)
@@ -31,7 +32,7 @@ class ConferenceIdentityResolver:
 
     def sanitize_meeting_url(self, meeting_url: str | None, platform: str) -> str | None:
         """
-        Strips sensitive tokens (e.g. pwd query param in Zoom URLs) before persistence.
+        Strips sensitive tokens (e.g. pwd query param in Zoom URLs, p/token/context in Teams URLs) before persistence.
         """
         if not meeting_url or not meeting_url.strip():
             return None
@@ -41,6 +42,17 @@ class ConferenceIdentityResolver:
                 parsed = urlparse(url)
                 qs = parse_qs(parsed.query)
                 qs.pop("pwd", None)
+                clean_query = urlencode(qs, doseq=True)
+                return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, clean_query, parsed.fragment))
+            except Exception:
+                return url
+        if platform == "MS_TEAMS" or any(d in url.lower() for d in ("teams.microsoft.com", "teams.live.com", "teams.cloud.microsoft")):
+            try:
+                parsed = urlparse(url)
+                qs = parse_qs(parsed.query)
+                qs.pop("p", None)
+                qs.pop("token", None)
+                qs.pop("context", None)
                 clean_query = urlencode(qs, doseq=True)
                 return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, clean_query, parsed.fragment))
             except Exception:
@@ -71,6 +83,37 @@ class ConferenceIdentityResolver:
                     return clean_slug
             return None
 
+        if platform == "MS_TEAMS" or (meeting_url and any(d in meeting_url.lower() for d in ("teams.microsoft.com", "teams.live.com", "teams.cloud.microsoft"))):
+            if meeting_url:
+                # 1. Short URL: /meet/1234567890 or /meet/241890123456
+                m_meet = re.search(r"/meet/(\d{10,12})", meeting_url)
+                if m_meet:
+                    return m_meet.group(1)
+                # 2. Query param: ?meetingId=1234567890 or &confno=1234567890
+                m_param = re.search(r"[?&](?:meetingid|meeting_id|confno)=(\d{10,12})", meeting_url, re.I)
+                if m_param:
+                    return m_param.group(1)
+                # 3. Meetup-join thread: /meetup-join/<raw_thread>
+                m_join = re.search(r"/meetup-join/([^/?#]+)", meeting_url, re.I)
+                if m_join:
+                    clean_thread = unquote(m_join.group(1)).strip().lower()
+                    thread_hash = hashlib.sha256(clean_thread.encode("utf-8")).hexdigest()[:16]
+                    return f"thread_{thread_hash}"
+            if meeting_space_name and meeting_space_name.strip():
+                clean_space = re.sub(r"\D", "", meeting_space_name)
+                if 10 <= len(clean_space) <= 12:
+                    return clean_space
+                if meeting_space_name.strip().startswith("thread_"):
+                    return meeting_space_name.strip()
+                if "@thread" in meeting_space_name.lower() or meeting_space_name.strip().startswith("19:"):
+                    clean_thread = unquote(meeting_space_name).strip().lower()
+                    thread_hash = hashlib.sha256(clean_thread.encode("utf-8")).hexdigest()[:16]
+                    return f"thread_{thread_hash}"
+                clean_slug = re.sub(r"[^a-zA-Z0-9_\-]", "", meeting_space_name.strip())
+                if clean_slug:
+                    return clean_slug
+            return None
+
         # Google Meet logic
         if meeting_space_name and meeting_space_name.strip():
             # e.g. "spaces/abc-defg-hij" or "abc-defg-hij"
@@ -88,11 +131,17 @@ class ConferenceIdentityResolver:
     ) -> str:
         """
         Normalizes meeting title to standard canonical format:
-        - If title is generic ("Meet", "Google Meet", "Zoom", "Zoom Meeting", empty) -> "<Prefix> - <meeting_code>"
+        - If title is generic ("Meet", "Google Meet", "Zoom", "Zoom Meeting", "Teams", "Microsoft Teams", empty) -> "<Prefix> - <meeting_code>"
         - If title is legacy "Google Meet (<meeting_code>)" -> "Meet - <meeting_code>"
         - If title is a custom calendar/user title (e.g. "Sprint Planning") -> "Sprint Planning"
         """
-        default_prefix = "Zoom" if platform == "ZOOM_WEB" else "Meet"
+        if platform == "MS_TEAMS":
+            default_prefix = "Teams"
+        elif platform == "ZOOM_WEB":
+            default_prefix = "Zoom"
+        else:
+            default_prefix = "Meet"
+
         if not title or not title.strip():
             return f"{default_prefix} - {meeting_code.strip()}" if meeting_code else default_prefix
 
@@ -102,6 +151,7 @@ class ConferenceIdentityResolver:
         generic_titles = (
             "meet", "google meet", "google meet session", "google meet (undefined)",
             "zoom", "zoom meeting", "zoom session", "zoom web client", "zoom (undefined)",
+            "teams", "microsoft teams", "microsoft teams meeting", "teams meeting", "teams session", "teams (undefined)",
         )
         if lower in generic_titles:
             return f"{default_prefix} - {meeting_code.strip()}" if meeting_code else default_prefix
@@ -114,6 +164,26 @@ class ConferenceIdentityResolver:
         if lower.startswith("zoom meeting (") and lower.endswith(")"):
             inner = stripped[14:-1].strip()
             return f"Zoom - {inner}" if inner else (f"Zoom - {meeting_code.strip()}" if meeting_code else "Zoom")
+
+        if lower.startswith("microsoft teams (") and lower.endswith(")"):
+            inner = stripped[17:-1].strip()
+            return f"Teams - {inner}" if inner else (f"Teams - {meeting_code.strip()}" if meeting_code else "Teams")
+
+        if lower.startswith("teams meeting (") and lower.endswith(")"):
+            inner = stripped[15:-1].strip()
+            return f"Teams - {inner}" if inner else (f"Teams - {meeting_code.strip()}" if meeting_code else "Teams")
+
+        if lower.startswith("teams (") and lower.endswith(")"):
+            inner = stripped[7:-1].strip()
+            return f"Teams - {inner}" if inner else (f"Teams - {meeting_code.strip()}" if meeting_code else "Teams")
+
+        # Strip trailing " | Microsoft Teams" or " - Microsoft Teams" from window titles
+        teams_suffix_match = re.search(r"\s*[|\-]\s*microsoft teams\s*$", stripped, re.I)
+        if teams_suffix_match:
+            cleaned = stripped[:teams_suffix_match.start()].strip()
+            if cleaned.lower() in generic_titles or not cleaned:
+                return f"{default_prefix} - {meeting_code.strip()}" if meeting_code else default_prefix
+            return cleaned
 
         return stripped
 
@@ -136,8 +206,13 @@ class ConferenceIdentityResolver:
         """
         now = datetime.now(timezone.utc)
         normalized_platform = (platform or "GOOGLE_MEET").upper().strip()
+        if normalized_platform in ("TEAMS", "MICROSOFT_TEAMS"):
+            normalized_platform = "MS_TEAMS"
+
         if meeting_url and ("zoom.us" in meeting_url.lower() or "zoomgov.com" in meeting_url.lower()):
             normalized_platform = "ZOOM_WEB"
+        elif meeting_url and any(d in meeting_url.lower() for d in ("teams.microsoft.com", "teams.live.com", "teams.cloud.microsoft")):
+            normalized_platform = "MS_TEAMS"
 
         sanitized_url = self.sanitize_meeting_url(meeting_url, normalized_platform)
         resolved_meeting_code = meeting_code or self.extract_meeting_code(sanitized_url, meeting_space_name, normalized_platform)
@@ -146,6 +221,13 @@ class ConferenceIdentityResolver:
 
         if normalized_platform == "ZOOM_WEB":
             conference_ident = f"zoom_{meeting_code}" if meeting_code else (f"zoom_{meeting_space_name}" if meeting_space_name else None)
+        elif normalized_platform == "MS_TEAMS":
+            if meeting_code:
+                conference_ident = meeting_code if meeting_code.startswith("teams:") else f"teams:{meeting_code}"
+            elif meeting_space_name:
+                conference_ident = meeting_space_name if meeting_space_name.startswith("teams:") else f"teams:{meeting_space_name}"
+            else:
+                conference_ident = None
         else:
             conference_ident = conference_record_name or meeting_code or (meeting_space_name.split("/")[-1] if meeting_space_name else None)
 
@@ -166,10 +248,11 @@ class ConferenceIdentityResolver:
             if existing is not None:
                 update_vals: dict[str, Any] = {}
                 existing_lower = (existing.title or "").strip().lower()
-                default_name = "Zoom" if existing.platform == "ZOOM_WEB" else "Meet"
+                default_name = "Teams" if existing.platform == "MS_TEAMS" else ("Zoom" if existing.platform == "ZOOM_WEB" else "Meet")
                 generic_titles = (
                     "meet", "google meet", "google meet session", "google meet (undefined)",
                     "zoom", "zoom meeting", "zoom session", "zoom web client", "zoom (undefined)",
+                    "teams", "microsoft teams", "microsoft teams meeting", "teams meeting", "teams session", "teams (undefined)",
                 )
                 if (existing_lower in generic_titles or not existing.title) and resolved_title != default_name:
                     update_vals["title"] = resolved_title
@@ -200,9 +283,11 @@ class ConferenceIdentityResolver:
         lookup_terms = [t for t in [conference_ident, meeting_code, conference_record_name, meeting_space_name] if t]
         if normalized_platform == "ZOOM_WEB" and meeting_code and f"zoom_{meeting_code}" not in lookup_terms:
             lookup_terms.append(f"zoom_{meeting_code}")
+        if normalized_platform == "MS_TEAMS" and meeting_code and f"teams:{meeting_code}" not in lookup_terms:
+            lookup_terms.append(f"teams:{meeting_code}")
 
         active_meeting = None
-        is_stale_zoom = False
+        is_stale_room = False
         closed_stale_room = False
         if lookup_terms:
             stmt = (
@@ -233,24 +318,24 @@ class ConferenceIdentityResolver:
                 latest_activity = latest_activity.replace(tzinfo=timezone.utc)
 
             # Platform-specific active session check:
-            # For ZOOM_WEB: A meeting room is only considered actively continuing if it has
+            # For ZOOM_WEB & MS_TEAMS: A meeting room is only considered actively continuing if it has
             # an active capture session with a heartbeat within the last 60 seconds, or was
             # created within the last 60 seconds (new room onboarding window).
             # Stale orphan meetings (> 60s inactive) must be closed to avoid reusing old meetings
-            # across distinct Zoom sessions sharing the same PMI / room URL.
-            if normalized_platform == "ZOOM_WEB":
+            # across distinct Zoom / Teams sessions sharing the same PMI / room URL.
+            if normalized_platform in ("ZOOM_WEB", "MS_TEAMS"):
                 created_tz = active_meeting.created_at.replace(tzinfo=timezone.utc) if active_meeting.created_at.tzinfo is None else active_meeting.created_at
                 created_age = (now - created_tz).total_seconds()
 
                 if max_session_hb is not None:
                     hb_tz = max_session_hb.replace(tzinfo=timezone.utc) if max_session_hb.tzinfo is None else max_session_hb
                     if (now - hb_tz).total_seconds() > 60:
-                        is_stale_zoom = True
+                        is_stale_room = True
                 elif created_age > 60:
                     # No active sessions recorded and created over 60 seconds ago
-                    is_stale_zoom = True
+                    is_stale_room = True
 
-            is_within_window = not is_stale_zoom and ((now - latest_activity).total_seconds() <= 1800)
+            is_within_window = not is_stale_room and ((now - latest_activity).total_seconds() <= 1800)
 
             if is_within_window:
                 # Valid active shared room -> Join as PARTICIPANT (or keep OWNER if creator)
@@ -264,10 +349,11 @@ class ConferenceIdentityResolver:
 
                 update_vals = {}
                 active_lower = (active_meeting.title or "").strip().lower()
-                default_name = "Zoom" if active_meeting.platform == "ZOOM_WEB" else "Meet"
+                default_name = "Teams" if active_meeting.platform == "MS_TEAMS" else ("Zoom" if active_meeting.platform == "ZOOM_WEB" else "Meet")
                 generic_titles = (
                     "meet", "google meet", "google meet session", "google meet (undefined)",
                     "zoom", "zoom meeting", "zoom session", "zoom web client", "zoom (undefined)",
+                    "teams", "microsoft teams", "microsoft teams meeting", "teams meeting", "teams session", "teams (undefined)",
                 )
                 if (active_lower in generic_titles or not active_meeting.title) and resolved_title != default_name:
                     update_vals["title"] = resolved_title

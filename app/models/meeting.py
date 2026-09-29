@@ -150,6 +150,31 @@ class Meeting(Base):
             if self.meeting_space_name and self.meeting_space_name.isdigit():
                 return self.meeting_space_name.strip()
 
+        if getattr(self, "platform", "GOOGLE_MEET") == "MS_TEAMS" or (self.conference_identity and self.conference_identity.startswith("teams:")):
+            if self.conference_identity and self.conference_identity.startswith("teams:"):
+                return self.conference_identity[6:]
+            if self.meeting_url:
+                import re
+                match_meet = re.search(r"/meet/(\d{10,12})", self.meeting_url)
+                if match_meet:
+                    return match_meet.group(1)
+                match_id = re.search(r"[?&](?:meetingid|meeting_id|confno)=(\d{10,12})", self.meeting_url, re.I)
+                if match_id:
+                    return match_id.group(1)
+                match_join = re.search(r"/meetup-join/([^/?#]+)", self.meeting_url)
+                if match_join:
+                    import hashlib
+                    from urllib.parse import unquote
+                    clean_thread = unquote(match_join.group(1)).strip().lower()
+                    thread_hash = hashlib.sha256(clean_thread.encode("utf-8")).hexdigest()[:16]
+                    return f"thread_{thread_hash}"
+            if self.meeting_space_name:
+                import re
+                clean_space = re.sub(r"\D", "", self.meeting_space_name)
+                if 10 <= len(clean_space) <= 12:
+                    return clean_space
+                return self.meeting_space_name.strip()
+
         if self.meeting_space_name and "/" in self.meeting_space_name:
             return self.meeting_space_name.split("/")[-1].strip()
         if self.meeting_space_name:

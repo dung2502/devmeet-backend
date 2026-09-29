@@ -113,6 +113,7 @@ class MeetingRepository:
         conditions = [
             (Meeting.conference_identity == clean_code)
             | (Meeting.conference_identity == f"zoom_{clean_code}")
+            | (Meeting.conference_identity == f"teams:{clean_code}")
             | (Meeting.meeting_space_name == clean_code)
             | (Meeting.meeting_url.ilike(f"%{clean_code}%"))
         ]
